@@ -1385,6 +1385,8 @@ Not to be confused with `secrets.command`, which runs a helper **once at startup
 Older configs used a top-level `custom_providers:` list instead. It still works — Hermes reads both — and `hermes update` auto-migrates it to the `providers:` dict (config v12). Field names differ slightly in the dict format: legacy `model` is `default_model`, and legacy `api_mode` is `transport`.
 :::
 
+**Reasoning effort on custom endpoints.** The configured `reasoning_effort` (`/reasoning max`, `agent.reasoning_effort`) reaches a custom endpoint unchanged on both the `chat_completions` and the `codex_responses` transport — up to `max`; only the Hermes-internal `ultra` is clamped to `max`. Two exceptions follow the host rather than the entry: a custom entry pointed at `api.openai.com` keeps OpenAI's per-model ladder (`max` is a gpt-5.6-only level there), and an entry pointed at a provider whose profile publishes a per-model vocabulary (Ramp Router) is clamped to that catalog. An endpoint that rejects the level answers with an HTTP 400 instead of Hermes silently downgrading it.
+
 Some OpenAI-compatible endpoints need provider-specific request body fields. Add an `extra_body` map to the matching custom provider and Hermes will merge it into each chat-completions request for that endpoint:
 
 ```yaml
@@ -1532,6 +1534,8 @@ model:
 # ~/.hermes/.env
 PERPLEXITY_API_KEY=your-perplexity-key
 ```
+
+Perplexity's Agent API (`api: https://api.perplexity.ai/v1` with `api_mode: codex_responses`) reserves the function names `web_search`, `search_files`, `fetch_url`, `people_search` and `finance_search` for its own built-in tools. Hermes renames its client tools of the same name to `hermes_<name>` on the wire and maps them back before dispatch, for the main agent loop and auxiliary calls (title generation, compression, MoA aggregation) alike — the same treatment OpenCode's `/v1/responses` endpoints get.
 
 #### Multiple providers in one config
 

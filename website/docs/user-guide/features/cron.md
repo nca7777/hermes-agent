@@ -264,7 +264,7 @@ hermes cron tick
 What they do:
 
 - `pause` — keep the job but stop scheduling it
-- `resume` — re-enable the job and compute the next future run
+- `resume` — re-enable the job. A recurring job whose slot came due while it was paused keeps that slot due, so the next tick fires one catch-up run (or logs the skip when `cron.catch_up_missed: false`) instead of silently jumping to the next occurrence; otherwise the next future run is computed
 - `run` — trigger the job on the next scheduler tick
 - `remove` — delete it entirely
 - `edit` — modify schedule, prompt, delivery, etc.
@@ -374,7 +374,7 @@ cron:
   require_restart_safe_scope: true
 ```
 
-The lasting fix is a user session for the gateway user: `sudo loginctl enable-linger <gateway-user>` (and `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` in the unit for system-level installs), then restart the gateway. Kanban workers always require a scope and fail closed regardless of this key.
+The lasting fix is a user session for the gateway user: `sudo loginctl enable-linger <gateway-user>` (and `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` in the unit for system-level installs), then restart the gateway. Kanban workers always require a scope under the managed gateway regardless of this key: a spawn the host cannot scope is recorded on the card as an infrastructure failure and retried later, never charged to the card (see the [Kanban docs](kanban.md#workers-and-systemd-cgroups)).
 
 The worker is the gateway's own interpreter running `python -m cron.scheduler`, with the gateway's checkout pinned on its `PYTHONPATH` (plus any entries the gateway itself was started with), so it imports the same Hermes tree the gateway runs — regardless of the venv's editable-install mapping, the unit's `WorkingDirectory`, or `PYTHONSAFEPATH` on the host. A worker that dies before acknowledging the handoff records its own stderr tail in the job's last error and in the execution ledger, so the failing import (or whatever killed it) is named instead of a bare exit code.
 
@@ -383,10 +383,11 @@ The worker is the gateway's own interpreter running `python -m cron.scheduler`, 
 Hermes records each claimed cron attempt in the profile-local
 `~/.hermes/cron/executions.db` before executor or provider dispatch. Attempts
 move through `claimed`, `running`, and one immutable terminal state:
-`completed`, `failed`, or `unknown`. After restart, Hermes marks an abandoned
-attempt `unknown` only when the original PID and process-start fingerprint prove
-that its owner is gone. Unknown attempts are audit records and are never
-automatically rerun.
+`completed`, `failed`, or `unknown`. After restart — and before every manual
+`hermes cron run` / `/cron run`, so a one-shot invocation with no scheduler
+running heals the ledger too — Hermes marks an abandoned attempt `unknown` only
+when the original PID and process-start fingerprint prove that its owner is
+gone. Unknown attempts are audit records and are never automatically rerun.
 
 Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
@@ -444,22 +445,36 @@ cron:
   retry_unreachable: false   # default true; disables the automatic re-runs
 ```
 
-### Failure incidents: acknowledge a known failure
+### Failure incidents: alert once, remind on a cooldown, acknowledge
 
-A recurring job that keeps failing with the *same* error pings you on every
-run. Each failure is also recorded as a durable **incident**, keyed by the
-job plus a normalized signature of the error text, in the same per-profile
-ledger database as the execution history.
+A recurring job that keeps failing with the *same* error alerts you **once**,
+not on every run. Each failure is recorded as a durable **incident**, keyed by
+the job plus a normalized signature of the error text, in the same per-profile
+ledger database as the execution history; the first failure of a signature is
+always delivered, and repeats are then withheld while the incident is `alerted`
+(the run is still recorded — `hermes cron runs` and the failure streak see it,
+only the ping is held back).
+
+```yaml
+cron:
+  failure_repeat_alert_hours: 6   # still broken after this long → one reminder ping,
+                                  # then silent again; 0 = alert on every failing run
+```
+
+Anything that changes the picture alerts immediately: a *different* error mints
+its own incident and pings at once, and a successful run re-arms the signature
+so the same error after a green run alerts again. If the incident ledger cannot
+be read, the ping is delivered rather than swallowed.
 
 ```bash
 hermes cron incidents                 # list incidents (newest activity first)
 hermes cron incidents --state alerted # filter: detected | alerted | resolved | closed
-hermes cron incidents ack <id>        # acknowledge — stop re-pinging
+hermes cron incidents ack <id>        # acknowledge — silence this signature for good
 ```
 
-Acknowledging an incident silences the per-run failure ping for that exact
-signature only. Nothing else changes: the run history still records every
-failure, the failure streak keeps counting, and the moment the job starts
+Acknowledging an incident silences the failure ping for that exact signature
+only, reminders included. Nothing else changes: the run history still records
+every failure, the failure streak keeps counting, and the moment the job starts
 failing with a *different* error a new incident is minted and alerts fire
 again.
 
@@ -470,13 +485,10 @@ the job later fails with the *same* error, the resolved incident re-opens as
 the exception: a success leaves them alone, and a repeat stays silent.
 
 Incident lifecycle: `detected` (failure recorded) → `alerted` (at least one
-failure ping reached delivery) → `resolved` (the job ran OK afterwards;
-re-opens on a repeat) or `closed` (acknowledged; terminal for that
-signature). Stored error text is secret-redacted and truncated before it is
-written.
-
-Recording is always on and costs nothing to ignore — no ping is ever
-suppressed until you explicitly `ack`.
+failure ping reached delivery; `alerted_at` is the latest one and starts the
+reminder cooldown) → `resolved` (the job ran OK afterwards; re-opens on a
+repeat) or `closed` (acknowledged; terminal for that signature). Stored error
+text is secret-redacted and truncated before it is written.
 
 ### Fleet health check: `hermes cron doctor`
 
@@ -539,6 +551,15 @@ When scheduling jobs, you specify where the output goes:
 | `"origin,all"` | Deliver to the origin **plus** every other connected channel | Combine any tokens |
 
 The agent's final response is automatically delivered to the configured `deliver:` target — the agent does not send messages itself, so there is nothing to call in the cron prompt.
+
+Delivered output is secret-redacted on the way out, on every lane: the platform message, the
+session mirror (payload and the job name spliced around it), and a `bot-chat` turn. Credential
+shapes (vendor-prefixed API keys, tokens, `KEY=value` assignments) are masked even when
+`security.redact_secrets: false` — that setting governs your own logs, not what leaves the
+machine — and a redactor failure replaces the payload rather than sending it unscanned.
+Credential-named URL query parameters are not stripped (magic links and pre-signed URLs are
+legitimate cron output), and user-chosen secrets with no recognisable shape are not detected.
+The run document under `cron/output/<job_id>/` keeps the agent's response as written.
 
 ### Delivery failures are a distinct status
 
@@ -826,6 +847,8 @@ cron:
 
 A timed-out delivery is recorded in `last_delivery_error`; the bot's turn may still complete on its own.
 
+The cap bounds the bot's **turn** only. When that turn messages a teammate (`message_agent`), the delivery process stays alive afterwards — bounded by `terminal.oneshot_completion_wait_seconds` — so the teammate's reply can land in the Bot Chat; that wait is not part of the delivery and is never counted against, or cut short by, this cap.
+
 ## No-agent mode (script-only jobs)
 
 For recurring jobs that don't need LLM reasoning — classic watchdogs, disk/memory alerts, heartbeats, CI pings — pass `no_agent=True` at creation time. The scheduler runs your script on schedule and delivers its stdout directly, skipping the agent entirely:
@@ -847,6 +870,18 @@ Semantics:
 - No tokens, no model, no provider fallback — the job never touches the inference layer.
 
 `.sh` / `.bash` files run under `bash` from `PATH` when available, otherwise `/bin/bash` (important on Windows Git Bash). Anything else runs under the current Python interpreter (`sys.executable`). Scripts must resolve inside `$HERMES_HOME/scripts/` — relative names, absolute paths, and `~`-prefixed paths are accepted when the resolved target stays in that directory; paths that escape it are rejected. Subprocess env is sanitized (`_sanitize_subprocess_env`): provider API credentials and other Hermes-managed secrets are **not** inherited by cron scripts.
+
+#### Giving a script a credential
+
+A script that must authenticate to an external service (an API token, a service-account key) gets it the same way terminal and `execute_code` children do — declare the variable name in the owning profile's `config.yaml` and define the value in that profile's `.env` (or an external [secret source](/user-guide/secrets/)):
+
+```yaml
+terminal:
+  env_passthrough:
+    - MY_SERVICE_TOKEN
+```
+
+The variable is forwarded into the script's environment with the **owning profile's** value: for a job that belongs to a profile served by a multi-profile gateway or the Desktop/dashboard backend, the value is resolved through that profile's secret scope, never the launch profile's process environment, and that profile's own `.env` credentials never reach another profile's scripts. Hermes-managed provider credentials (`OPENAI_API_KEY`, gateway tokens, …) cannot be declared — the sanitizer rejects them. On a single-profile install the script inherits what the gateway's `.env` put in the process environment, as before. Log presence (`set`/`MISSING`), never the value: script output is delivered verbatim.
 
 ### The agent sets these up for you
 

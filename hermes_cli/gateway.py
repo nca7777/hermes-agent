@@ -3904,8 +3904,24 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
 
 
 def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> None:
-    """Shared launchctl failure policy: domain unmanageable (5/125) → detached fallback; else re-raise."""
+    """Shared launchctl failure policy: domain unmanageable (5/125) → detached fallback; else re-raise.
+
+    A 5/125 exit is evidence about the *domain* only when launchd is not already supervising this job.
+    EIO (5) is ``launchctl bootstrap``'s answer for a label that is already loaded, so the ordinary
+    "reinstall/restart over the live gateway" case lands here with the service up and supervised.
+    Degrading there is not a graceful fallback: it writes the permanent launchd-unsupported marker and
+    starts a detached gateway *beside* the supervised one, and the marker makes
+    :func:`wait_for_launchd_gateway_supervision` answer True unconditionally — so no later
+    install/update can tell that nothing ties the gateway to launchd any more. A live supervised PID is
+    direct evidence this macOS does manage the job, so surface the failure instead of branding the host.
+    """
     if not _launchctl_domain_unsupported(exc.returncode):
+        raise exc
+    label = get_launchd_label()
+    if _launchctl_label_supervising_process(label):
+        print(f"⚠ {what} failed (exit {exc.returncode}), but launchd still supervises {label}")
+        print("  Not switching to the detached fallback — this host manages the job.")
+        print("  Apply the definition with: hermes gateway stop && hermes gateway install --force")
         raise exc
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
@@ -6050,6 +6066,12 @@ def _maybe_redirect_run_to_s6_supervision(args) -> bool:
         return False
     if not _dispatch_via_service_manager_if_s6("start"):
         return False
+    # This process never reaches a GatewayRunner, so the watchdog armed by hermes_cli.main's argv
+    # fast-path has no other disarm site: the in-process heartbeat below parks with zero CPU and no
+    # progress lease, which the watchdog reads as a startup deadlock and os._exit(75)s the CMD process.
+    from hermes_startup_watchdog import disarm_startup_watchdog
+
+    disarm_startup_watchdog()
     # Breadcrumb on stderr (keep stdout clean for scripts); gateway logs follow via s6-log.
     print(
         "→ gateway is now running under s6 supervision (auto-restart on crash,\n"

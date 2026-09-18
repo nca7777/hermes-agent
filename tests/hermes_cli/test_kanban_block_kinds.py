@@ -40,9 +40,11 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _running_task(conn, title="t"):
-    """Create a task and drive it to ``running`` so block_task can act."""
+def _running_task(conn, title="t", parents=()):
+    """Create a task (linked under ``parents`` first) and drive it to ``running`` so block_task can act."""
     tid = kb.create_task(conn, title=title, assignee="worker")
+    for parent in parents:
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     claimed = kb.claim_task(conn, tid, claimer="worker")
@@ -94,7 +96,12 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     with kbc.connect_closing() as conn:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.link_tasks(
+            conn,
+            parent_id=parent,
+            child_id=child,
+            expected_child_run_id=kb.get_task(conn, child).current_run_id,
+        )
         kb.block_task(conn, child, reason="wait", kind="dependency")
         assert kb.get_task(conn, child).status == "todo"
         # Finish the parent, then let recompute_ready run.
@@ -118,8 +125,8 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         parent = kb.create_task(conn, title="already-done-parent", assignee="worker")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
-        child = _running_task(conn, title="child-of-done")
-        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        # The edge exists before the run: link_tasks refuses to gate a running child retroactively.
+        child = _running_task(conn, title="child-of-done", parents=(parent,))
 
         # `hermes kanban block <child> --kind dependency waiting on upstream`
         args = argparse.Namespace(task_id=child, ids=None, reason=["waiting", "on", "upstream"], kind="dependency")
@@ -157,8 +164,12 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
 
     with kbc.connect() as conn:
         parent = kb.create_task(conn, title="open-parent", assignee="alice")
-        child = _running_task(conn, title="waiter")
+        # Linked while todo (a running child cannot be gated retroactively); the parent then stays
+        # open while the child runs — the reopened-parent shape, forced the same way the loop below does.
+        child = kb.create_task(conn, title="waiter", assignee="worker")
         kb.link_tasks(conn, parent_id=parent, child_id=child)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
         for _ in range(kb.BLOCK_RECURRENCE_LIMIT + 1):
             assert kb.block_task(conn, child, reason="wait", kind="dependency")
             parked = kb.get_task(conn, child)

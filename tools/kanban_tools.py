@@ -400,11 +400,24 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
     if not task or not task.goal_mode or not _goal_judge_available():
         return
     try:
-        verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+        # Headless gate runs outside any agent turn: bind the per-task relay-affinity scope
+        # (mirrors kanban_specify) so the relay does not reject the judge call (#113669).
+        from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
+        affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
+        try:
+            verdict, reason, _, _, transport_failed = judge_goal(
+                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+        finally:
+            if affinity_token is not None:
+                reset_affinity_scope(affinity_token)
     except Exception as judge_exc:
         logger.warning(
             "goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)
+        return
+    if transport_failed:
+        # ``judge_goal`` fails open to ``continue`` on transport errors (relay 400, auth, timeout);
+        # an unreachable judge is not a human "not done" and must not reject the handoff (#83610).
+        logger.warning("goal judge unreachable (%s), allowing lifecycle handoff", reason)
         return
     if verdict == "done":
         return
@@ -522,6 +535,10 @@ def _handle_show(args: dict, **kw) -> str:
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
+            # Non-terminal parents; on a running card this means the dependency
+            # gate is not holding it and kanban_complete will refuse.
+            "unsatisfied_parents": [
+                {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
             "children": kb.child_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
             # Capped; full log via CLI.
@@ -617,8 +634,18 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
         task = kb.get_task(conn, tid)
-        _check(ok, (task.last_failure_error if task else None) or
-               f"could not complete {tid} (unknown id, stale run, or already terminal)")
+        if not ok:
+            # complete_task reports every refusal as bare False; a reopened or
+            # never-finished parent is the actionable one. Name the blockers so
+            # the worker/operator completes the parents instead of re-running.
+            blockers = kb.unsatisfied_parents(conn, tid)
+            if blockers:
+                detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
+                raise _Reject(
+                    f"could not complete {tid}: unsatisfied parent dependencies: "
+                    f"{detail}; complete the parents first (done or archived)")
+            _check(False, (task.last_failure_error if task else None) or
+                   f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
         return _ok(task_id=tid, run_id=run.id if run else None)
 
@@ -862,6 +889,24 @@ def _handle_attachments(args: dict, **kw) -> str:
                 _fields(a, _ATTACHMENT_FIELDS) for a in kb.list_attachments(conn, tid)]})
 
 
+def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+    """Return a session id only when it is present in this profile's state.db."""
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+        from hermes_constants import get_hermes_home
+
+        state = SessionDB(db_path=get_hermes_home() / "state.db", read_only=True)
+    except Exception:  # state.db may not exist for a CLI/dashboard invocation
+        logger.debug("Could not open state.db to verify Kanban provenance", exc_info=True)
+        return None
+    try:
+        return session_id if state.get_session(session_id) else None
+    finally:
+        state.close()
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
@@ -885,13 +930,19 @@ def _handle_create(args: dict, **kw) -> str:
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
+        from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                     if _is_dispatcher_owned_worker() else None)
         self_task = kb.get_task(conn, self_tid) if self_tid else None
         # The worker/API runtime may be transient; the owning task's origin is durable.
-        session_id = (args.get("session_id") or (self_task.session_id if self_task else None)
-                      or _current_origin_session_id() or os.environ.get("HERMES_SESSION_ID"))
+        # The ambient id is the request-scoped ContextVar binding, not the process-global
+        # os.environ: in a multi-session gateway the env holds the LAST agent built, and an
+        # id that never reached its ``sessions`` row is provenance pointing at nothing.
+        session_id = (_persisted_session_id(args.get("session_id"))
+                      or (self_task.session_id if self_task else None)
+                      or _persisted_session_id(_current_origin_session_id())
+                      or _persisted_session_id(get_session_env("HERMES_SESSION_ID", "")))
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
@@ -1011,13 +1062,17 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
-    """Add a parent→child dependency edge after the fact (cycles/self-links → ValueError)."""
+    """Add a parent→child dependency edge after the fact (cycles/self-links/running
+    children → ValueError). A worker linking its OWN running card proves ownership
+    with its run id so the dependency-block handoff still works."""
     _reject_delegated_child_mutation("kanban_link")
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
     with _board(args.get("board")) as (kb, conn):
-        gated = kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+        gated = kb.link_tasks(
+            conn, parent_id=parent_id, child_id=child_id,
+            expected_child_run_id=_worker_run_id(str(child_id)))
         return _ok(parent_id=parent_id, child_id=child_id, gated=gated,
                    **({"gated_by": parent_id} if gated else {}))
 

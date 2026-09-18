@@ -2774,6 +2774,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
 
+    async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
+                                        notification_category: str = "result") -> None:
+        """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key);
+        see ``api_server_runs.run_internal_session_turn``."""
+        await _api_runs.run_internal_session_turn(
+            self, session_id=session_id, text=text, profile=profile,
+            notification_category=notification_category, _api_server=sys.modules[__name__])
+
     @_require_auth
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
