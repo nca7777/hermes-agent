@@ -3122,6 +3122,9 @@ def _wait_for_external_cron_worker_body(
             returncode = process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
             if _is_terminal():
+                from cron.scheduler_detached_worker import reap_terminal_worker_in_background
+
+                reap_terminal_worker_in_background(process)
                 return True
             continue
         # The worker can commit its terminal row and exit between the first

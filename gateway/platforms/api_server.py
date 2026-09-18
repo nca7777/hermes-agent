@@ -1208,6 +1208,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def interrupt_active_runs(self, reason: str) -> int:
         """Interrupt every adapter-owned agent during shutdown (they are not in
         ``GatewayRunner._running_agents``): exactly the set the drain waits on. Returns count."""
+        run_ids = {
+            run_id for run_id, task in self._active_run_tasks.items() if not task.done()
+        } | set(self._active_run_agents)
+        _api_runs._mark_shutdown_interrupted_runs(self, run_ids)
         # Dedupe by identity: an agent in both registries must be interrupted once.
         agents = {id(agent): agent for agent in (
             *self._active_run_agents.values(), *self._shutdown_interruptible_agents.values())
@@ -2807,8 +2811,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # which would fail `hermes peer dm` resolution and mint transient sessions — same accident
                 # the tui_gateway lookups heal.
                 from tools.bot_mode_probe import BOT_CHAT_TITLE
-                stale = db.get_session_by_title(title_filter) if title_filter == BOT_CHAT_TITLE else None
-                if stale and stale.get("archived") and db.unarchive_recoverable_session(stale["id"]):
+
+                def _resurrect() -> bool:
+                    # Lookup + unarchive (a WRITE with the full write patience) as one worker-thread
+                    # hop: a contended lock parks this thread, never the event loop (#113772).
+                    stale = db.get_session_by_title(title_filter)
+                    return bool(stale and stale.get("archived") and db.unarchive_recoverable_session(stale["id"]))
+
+                if title_filter == BOT_CHAT_TITLE and await asyncio.to_thread(_resurrect):
                     sessions = await _list()
             except Exception:
                 pass  # resolution degrades to today's no-row behavior
@@ -3051,7 +3061,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return None, lock_error
-        if not self._persist_session_runtime_lock(session_id, runtime_request):
+        if not await asyncio.to_thread(self._persist_session_runtime_lock, session_id, runtime_request):
             return None, _error_response(
                 "Could not persist the requested session model lock", 500, code="model_lock_persistence_failed")
         lock_active = bool(runtime_request.get("require_model_lock"))
@@ -3303,7 +3313,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
-        if not self._persist_session_runtime_lock(session_id, runtime_request):
+        if not await asyncio.to_thread(self._persist_session_runtime_lock, session_id, runtime_request):
             return _error_response(
                 "Could not persist the requested session model lock", 500, code="model_lock_persistence_failed")
         requested = runtime_request.get("requested") or {}

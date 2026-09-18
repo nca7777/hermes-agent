@@ -118,6 +118,48 @@ def test_mcp_oauth_helpers_use_dashboard_flow_without_loopback_port():
     assert flow.authorization_url == "https://idp.example/authorize?state=state-4"
 
 
+def _flow(flow_id: str):
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    return DashboardOAuthFlow(
+        flow_id=flow_id, server_name="asana", profile=None, hermes_home="/tmp/hermes-test",
+        redirect_uri=f"https://agent.example/mcp/oauth/callback/{flow_id}")
+
+
+def test_first_mark_error_reason_reaches_callback_waiter_and_is_never_clobbered():
+    """A failure marked before any browser redirect (worker crash, authorization-URL timeout,
+    user cancel) must reach the SDK's callback waiter — not the generic no-code line — and the
+    worker's follow-on ``mark_error`` (the waiter's own exception) must not overwrite the cause
+    the dashboard/Desktop polls. A delivered callback likewise survives a late ``mark_error``."""
+    flow = _flow("flow-err")
+    flow.mark_error("OAuth cancelled by user")
+    with pytest.raises(RuntimeError, match="OAuth cancelled by user"):
+        asyncio.run(flow.wait_for_callback())
+    flow.mark_error("OAuth authorization failed: OAuth cancelled by user")
+    assert flow.snapshot()["error"] == "OAuth cancelled by user"
+
+    delivered = _flow("flow-late")
+    asyncio.run(delivered.publish_authorization_url("https://idp.example/authorize?state=s9"))
+    delivered.deliver_callback(code="code-9", state="s9", error=None)
+    delivered.mark_error("worker crashed after the browser redirected")
+    assert asyncio.run(delivered.wait_for_callback())[:2] == ("code-9", "s9")
+
+
+def test_empty_exception_text_stays_diagnosable():
+    """``str()`` of a bare ``TimeoutError()``/``RuntimeError()`` is ""; the workers record the type
+    name and the flow never exposes a blank cause to the waiter or the poller."""
+    from tools.mcp_dashboard_oauth import exception_message
+
+    assert exception_message(RuntimeError()) == "RuntimeError"
+    assert exception_message(RuntimeError("boom")) == "boom"
+
+    flow = _flow("flow-empty")
+    flow.mark_error("")
+    assert flow.snapshot()["error"]
+    with pytest.raises(RuntimeError, match="empty error message"):
+        asyncio.run(flow.wait_for_callback())
+
+
 def test_failed_reauth_rollback_preserves_newer_oauth_state(tmp_path, monkeypatch):
     from tools.mcp_oauth import HermesTokenStorage
 

@@ -346,6 +346,17 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_block_dependency_without_open_parent_is_rekinded(worker_env):
+    """kind=dependency with no incomplete parent must not park in todo; the
+    tool reports the landed kind and tells the worker why."""
+    from tools import kanban_tools as kt
+
+    d = json.loads(kt._handle_block({"reason": "upstream input is missing", "kind": "dependency"}))
+    assert (d["ok"], d["status"], d["block_kind"]) == (True, "blocked", "needs_input")
+    assert d["requested_kind"] == "dependency"
+    assert "no parent is open" in d["note"]
+
+
 def test_heartbeat_extends_claim_expires(worker_env):
     """The kanban_heartbeat tool MUST extend claim_expires, not just
     update last_heartbeat_at — otherwise long-running workers loop the

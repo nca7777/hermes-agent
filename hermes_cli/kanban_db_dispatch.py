@@ -38,7 +38,8 @@ DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
 
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
-# and call kanban_block/kanban_complete before max_runtime_seconds kills it.
+# and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
+# before max_runtime_seconds kills it.
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 
 # A healthy worker is still alive for a while after kanban_complete /
@@ -896,14 +897,17 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 
 _PROTOCOL_VIOLATION_ERROR = (
     # Worker subprocess returned 0 but its task is still ``running`` in the DB — it exited without calling
-    # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the work itself succeeded and only the
+    # ``kanban_complete`` / ``kanban_block`` / ``kanban_request_review``. Overwhelmingly the work itself succeeded and only the
     # paperwork was skipped, so a retry usually completes; the corrective sentence below is surfaced to the
     # retry worker via the prior-attempt error in ``build_worker_context`` (guidance approach from #61817).
-    "worker exited cleanly (rc=0) without calling "
-    "kanban_complete or kanban_block — protocol violation. "
+    # Keep this short: ``_record_task_failure`` caps the stored error at 500 chars and the worker's own
+    # last output (``_worker_final_output``, up to 400 chars) is appended after it — a longer preamble
+    # truncates away the worker's explanation, which is the part the board and the retry worker need.
+    "worker exited cleanly (rc=0) without kanban_complete, kanban_block "
+    "or kanban_request_review — protocol violation. "
     "If the prior run already did the work, verify it and "
-    "report the result via kanban_complete; a run that ends "
-    "without a terminal kanban call counts as failed no "
+    "report it via kanban_complete (or kanban_request_review); "
+    "a run without a terminal kanban call counts as failed no "
     "matter what it did."
 )
 
@@ -1990,8 +1994,8 @@ def _tick_spawn_budget(
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
     """
     # Count already-running tasks so max_spawn enforces concurrency, not a
-    # per-tick budget: "running" tasks stay running until the worker calls
-    # kanban_complete/kanban_block or the TTL reclaims them.
+    # per-tick budget: "running" tasks stay running until the worker makes a terminal
+    # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.
     running_count = 0
     spawn_budget: Optional[int] = None
     if max_spawn is not None or max_in_progress is not None:
