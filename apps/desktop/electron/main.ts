@@ -430,6 +430,7 @@ import {
   rateLimitFromHeaders
 } from './update-api-check'
 import { waitForUpdateClearance } from './update-gate'
+import { localBehind } from './update-local-count'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
@@ -3215,6 +3216,8 @@ async function checkUpdates({ force = false }: { force?: boolean } = {}) {
   }
 
   const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+  // Same runner, uncollapsed: the local-count fallback needs exit codes.
+  const rawGit = (args: string[]) => runGit(args, { cwd: updateRoot })
 
   const [currentSha, dirtyStr, currentBranch, originUrl] = await Promise.all([
     git(['rev-parse', 'HEAD']),
@@ -3234,8 +3237,8 @@ async function checkUpdates({ force = false }: { force?: boolean } = {}) {
   const slug = githubRepoSlug(originUrl)
 
   const status = slug
-    ? await checkUpdatesViaApi({ slug, branch, currentSha })
-    : await checkUpdatesViaLsRemote({ updateRoot, branch, currentSha })
+    ? await checkUpdatesViaApi({ slug, branch, currentSha, git: rawGit })
+    : await checkUpdatesViaLsRemote({ updateRoot, branch, currentSha, git: rawGit })
 
   const result = {
     supported: true,
@@ -3276,7 +3279,7 @@ function writeUpdateCheckCache(entry) {
 // then the compare endpoint only when the tips differ — it yields the exact
 // behind count plus the commit list the overlay renders, replacing both
 // `rev-list --count` and `git log HEAD..origin/<branch>`.
-async function checkUpdatesViaApi({ slug, branch, currentSha }) {
+async function checkUpdatesViaApi({ slug, branch, currentSha, git }) {
   let targetSha
 
   try {
@@ -3306,6 +3309,19 @@ async function checkUpdatesViaApi({ slug, branch, currentSha }) {
     return { behind: 0, updateAvailable: false, targetSha, commits: [] }
   }
 
+  // No compare answer, but the tip is a commit we hold: count in the local
+  // graph. This is the diverged-checkout case — local HEAD isn't on GitHub
+  // (every in-app update merges origin/main into the branch), the endpoint
+  // 404s, and the count-less "unknown" fallback below renders as a
+  // permanent "(update)" badge that no amount of clicking can clear.
+  if (!compared) {
+    const local = await localBehind(targetSha, git)
+
+    if (local) {
+      return { behind: local.behind, updateAvailable: local.behind > 0, targetSha, commits: local.commits }
+    }
+  }
+
   return {
     behind: compared ? compared.behind : null,
     updateAvailable: true,
@@ -3316,7 +3332,7 @@ async function checkUpdatesViaApi({ slug, branch, currentSha }) {
 
 // Non-GitHub origins: one ls-remote for the tip SHA (still no pack transfer),
 // counting via the local graph only when the tip is already known locally.
-async function checkUpdatesViaLsRemote({ updateRoot, branch, currentSha }) {
+async function checkUpdatesViaLsRemote({ updateRoot, branch, currentSha, git }) {
   const target = await runGit(['ls-remote', 'origin', `refs/heads/${branch}`], { cwd: updateRoot })
   const targetSha = firstLine(target.stdout).split(/\s+/)[0] || ''
 
@@ -3328,13 +3344,14 @@ async function checkUpdatesViaLsRemote({ updateRoot, branch, currentSha }) {
     return { behind: 0, updateAvailable: false, targetSha, commits: [] }
   }
 
-  const known = (await runGit(['cat-file', '-e', `${targetSha}^{commit}`], { cwd: updateRoot })).code === 0
+  // Local-graph answer when we hold the tip: 0 for a tip reachable from HEAD
+  // (local commits sitting ahead, not behind), the real count otherwise. Same
+  // reasoning as the API path — a non-GitHub fork diverged by local commits
+  // would otherwise show an "(update)" badge it can never clear.
+  const local = await localBehind(targetSha, git)
 
-  const isAncestor =
-    known && (await runGit(['merge-base', '--is-ancestor', targetSha, 'HEAD'], { cwd: updateRoot })).code === 0
-
-  if (isAncestor) {
-    return { behind: 0, updateAvailable: false, targetSha, commits: [] }
+  if (local) {
+    return { behind: local.behind, updateAvailable: local.behind > 0, targetSha, commits: local.commits }
   }
 
   return { behind: null, updateAvailable: true, targetSha, commits: [] }
