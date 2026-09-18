@@ -542,6 +542,15 @@ def check_image_generation_requirements() -> bool:
         return False
     # Probe only the selected plugin: a cloud key alone must not opt a user into a paid backend.
     provider = _get_plugin_provider(configured)
+    if provider is None:
+        # Long-lived sessions (desktop/dashboard serve) may have discovered plugins before this
+        # backend was installed, enabled, or selected — discovery is once-per-process. Mirror the
+        # generate path's one-shot forced refresh, else the availability gate hides a backend that
+        # generation itself could still reach (avatar pickers read `available` and never dispatch).
+        try:
+            provider = _get_plugin_provider(configured, force=True)
+        except Exception as exc:
+            logger.debug("image_gen plugin force-refresh skipped: %s", exc)
     return bool(provider and provider.is_available())
 
 

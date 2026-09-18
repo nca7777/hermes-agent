@@ -70,3 +70,59 @@ class TestPluginDispatch:
             image_generation_tool, "_read_configured_image_provider", lambda: None
         )
         assert image_generation_tool.check_image_generation_requirements() is False
+
+    def test_requirements_force_refresh_on_registry_miss(self, monkeypatch):
+        """Plugin discovery is once-per-process, so a long-lived session (desktop/dashboard
+        serve) that resolved plugins before a backend was installed, enabled, or selected must
+        still answer the gate truthfully — otherwise the avatar picker reads `available: false`
+        and never dispatches, even though generation itself would have found the backend."""
+        from tools import image_generation_tool
+
+        calls: list[bool] = []
+
+        class _AvailableProvider(_FakeCodexProvider):
+            def is_available(self) -> bool:
+                return True
+
+        def _lookup(name, *, force: bool = False):
+            calls.append(force)
+            return _AvailableProvider() if force else None
+
+        monkeypatch.setattr(image_generation_tool, "check_fal_api_key", lambda: False)
+        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "codex")
+        monkeypatch.setattr(image_generation_tool, "_get_plugin_provider", _lookup)
+
+        assert image_generation_tool.check_image_generation_requirements() is True
+        assert calls == [False, True]
+
+    def test_requirements_registered_provider_is_not_force_refreshed(self, monkeypatch):
+        """A registry hit stays on the cheap path: no forced plugin reload per probe."""
+        from tools import image_generation_tool
+
+        calls: list[bool] = []
+
+        class _AvailableProvider(_FakeCodexProvider):
+            def is_available(self) -> bool:
+                return True
+
+        def _lookup(name, *, force: bool = False):
+            calls.append(force)
+            return _AvailableProvider() if not force else None
+
+        monkeypatch.setattr(image_generation_tool, "check_fal_api_key", lambda: False)
+        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "codex")
+        monkeypatch.setattr(image_generation_tool, "_get_plugin_provider", _lookup)
+
+        assert image_generation_tool.check_image_generation_requirements() is True
+        assert calls == [False]
+
+    def test_requirements_false_when_provider_absent_after_refresh(self, monkeypatch):
+        """A genuinely missing backend still reports False after the refresh — no false positive."""
+        from tools import image_generation_tool
+
+        monkeypatch.setattr(image_generation_tool, "check_fal_api_key", lambda: False)
+        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "nope")
+        monkeypatch.setattr(
+            image_generation_tool, "_get_plugin_provider", lambda name, force=False: None
+        )
+        assert image_generation_tool.check_image_generation_requirements() is False
