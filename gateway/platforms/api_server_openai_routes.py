@@ -357,6 +357,20 @@ class _ResponsesStream:
         await self.write_event("response.output_item.done", {
             "type": "response.output_item.done", "output_index": rs["output_index"], "item": item})
 
+    async def emit_commentary(self, text: str) -> None:
+        """Mid-turn assistant commentary as its own completed ``message`` item carrying
+        ``"phase": "commentary"`` — never appended to ``final_text_parts``, so the final answer
+        item stays clean (#67580). Closes any open reasoning item first so a reasoning item
+        never straddles a message item."""
+        await self.close_reasoning_item()
+        item = {"id": f"msg_{uuid.uuid4().hex[:24]}", "status": "completed", "phase": "commentary",
+                **_message_item(text)}
+        idx = self.output_index
+        self.output_index += 1
+        self.emitted_items.append({"phase": "commentary", **_message_item(text)})
+        for event in ("response.output_item.added", "response.output_item.done"):
+            await self.write_event(event, {"type": event, "output_index": idx, "item": item})
+
     async def emit_tool_started(self, payload: Dict[str, Any]) -> None:
         """function_call ``output_item.added``; the agent's tool_call_id beats a generated call id."""
         await self.close_reasoning_item()
@@ -411,6 +425,8 @@ class _ResponsesStream:
                 await self.emit_tool_started(payload)
             elif tag == "__tool_completed__":
                 await self.emit_tool_completed(payload)
+            elif tag == "__commentary__":
+                await self.emit_commentary(payload["text"])
             elif tag == "__reasoning__":
                 await self.emit_reasoning_delta(payload)
         elif isinstance(item, str):
@@ -1049,10 +1065,16 @@ class OpenAICompatRoutesMixin:
                 _stream_q.put_threadsafe(("__tool_completed__", {
                     "tool_call_id": tool_call_id, "name": function_name,
                     "arguments": function_args or {}, "result": function_result}))
+
+            def _on_commentary(text, *, already_streamed: bool = False):
+                # Already-streamed text went out as output_text.delta of the final item; a second
+                # copy as a commentary item would duplicate it.
+                if not already_streamed and isinstance(text, str) and text.strip():
+                    _stream_q.put_threadsafe(("__commentary__", {"text": text}))
             agent_task, agent_ref = self._spawn_stream_agent(
                 _stream_q, tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start, tool_complete_callback=_on_tool_complete,
-                **run_kwargs)
+                interim_assistant_callback=_on_commentary, **run_kwargs)
             return await self._write_sse_responses(
                 request=request, response_id=f"resp_{uuid.uuid4().hex[:28]}",
                 model=body.get("model", self._model_name), created_at=int(time.time()),

@@ -571,6 +571,43 @@ def test_hybrid_first_sentence_streamed_individually(monkeypatch):
     sys.platform == "darwin",
     reason="macOS deliberately skips the sounddevice OutputStream path (PR #62601)",
 )
+def test_speaker_honours_tts_streaming_min_len_for_short_cjk_opener(monkeypatch):
+    """The CLI/TUI speaker cuts with the profile's tts.streaming.min_len (#96927): a 7-char CJK
+    opener is streamed on its own instead of riding behind the second sentence."""
+    from tools import tts_tool
+    from tools.tts_tool_speaker import stream_tts_to_speaker
+
+    stream_calls: list[str] = []
+
+    class _Tracking(ts.StreamingTTSProvider):
+        sample_rate = 24000
+
+        @staticmethod
+        def available():
+            return True
+
+        def stream(self, text):
+            stream_calls.append(text)
+            yield b"\x00\x00" * 10
+
+    sd, _out = _sd_mock()
+    q = _drain_queue(["记得，叫团团. ", "然后我们再说第二句话，这一句要长一些才行. "])
+    stop, done = threading.Event(), threading.Event()
+
+    with patch("tools.tts_streaming.resolve_streaming_provider",
+               return_value=_Tracking({}, {})), \
+         patch.object(tts_tool, "_load_tts_config", return_value={"streaming": {"min_len": 6}}), \
+         patch.object(tts_tool, "_import_sounddevice", return_value=sd):
+        stream_tts_to_speaker(q, stop, done)
+
+    assert stream_calls[0] == "记得，叫团团.", stream_calls
+    assert done.is_set()
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="macOS deliberately skips the sounddevice OutputStream path (PR #62601)",
+)
 def test_hybrid_subsequent_sentences_prefetched_individually(monkeypatch):
     """Every sentence should get its own stream() call — per-sentence
     prefetch fires the HTTP request the moment each sentence completes,

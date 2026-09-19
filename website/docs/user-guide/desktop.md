@@ -194,6 +194,7 @@ Manage providers, models, tools, and credentials from a real UI instead of editi
 
 - **Providers settings pane** — a dedicated place to manage inference providers, with an Accounts / API-keys UX for signing in and storing credentials per provider. Accounts and API keys share the Settings **Applies to** selection: credential reads and edits, OAuth account removal, and sign-in launched here target the selected profile, not the active chat profile. The sign-in flow keeps that target through credential saving and model selection. Changing **Applies to** discards unsaved credential drafts. Closing sign-in cancels polling and ignores late results; a credential write already sent may still finish in its original profile. Externally managed CLI credentials use their own CLI and are not covered by this profile selector. Its **Local Models** view installs and manages an on-device llama.cpp runtime — see [Local Models](./local-models.md).
 - **Every provider and model in the menus** — the GUI surfaces the full provider list and every model that `hermes model` knows about, so you pick from the same catalog the CLI sees rather than a curated subset.
+- **Custom endpoints with an API mode** — **Settings → Providers → Custom Endpoints** has an **API Mode** selector (**Auto-detect**, **Chat Completions**, **Responses API**, **Anthropic Messages**) — the same choice `hermes model` offers for a custom provider. It is saved as `providers.<id>.api_mode` in `config.yaml`, so a Responses-only or Anthropic-compatible host is no longer called on `/chat/completions`. **Test** checks the transport you will actually use, not just `/v1/models`: it sends a one-token request to the pinned mode's route (or to the mode Auto-detect resolves to) and fails with the transport named when the host does not serve it. **Test** also keeps the alias metadata a gateway advertises in `/v1/models` (`canonical_model`, `reasoning_effort`): picking an alias such as `gpt-5.6-sol-high` saves the canonical model and pins its effort under `agent.reasoning_overrides`.
 - **xAI Grok OAuth** — Grok is a first-class OAuth provider in the launcher; sign in through the browser flow like the other OAuth providers.
 - **Tool-backend installs from the GUI** — run a tool backend's post-setup install steps directly from the app instead of dropping to a terminal. In the terminal backend picker, selecting a backend marked **Needs setup** asks for confirmation first; declining leaves the current backend selected.
 - **Terminal font picker** — choose an installed font in **Settings → Appearance**. Nerd Fonts such as `MesloLGS NF` render Powerlevel10k separators and icons in both interactive and agent terminals; the setting is saved per profile.
@@ -537,6 +538,11 @@ generic error toast. The card offers recovery actions matched to the failure:
 
 - **Retry** — re-runs the failed turn in place (hidden when retrying would
   deterministically reproduce the failure, e.g. a content-policy rejection).
+  When a rate-limit or usage-limit response names when the limit lifts
+  (`Retry-After` header or a `resets_at` field), the card shows **Limit resets
+  at HH:mm (in 1h 05m)** next to Retry so you know when a retry will work; the
+  CLI/TUI print the same line under the error. The hint is informational — the
+  turn is not retried automatically.
 - **Switch provider** — for provider, endpoint, auth, and billing failures,
   opens the composer's live model menu so you can move **this chat** to another
   provider/model right away (Settings → Models only changes the default for new

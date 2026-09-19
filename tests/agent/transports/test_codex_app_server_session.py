@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 import logging
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 from typing import Any, Optional
 
@@ -195,6 +196,36 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert "developerInstructions" not in params
         assert params["personality"] == "none"
+
+    def test_named_custom_provider_selects_codex_model_provider(self, monkeypatch):
+        """#75186: for ``provider=custom`` + a configured ``providers.<name>`` entry, the session built by
+        ``_ensure_codex_session`` sends ``model`` + ``modelProvider=<name>`` on thread/start and never the
+        API key; openai/openai-codex agents keep codex's defaults (cwd only)."""
+        import hermes_cli.runtime_provider as rp
+        from agent.codex_runtime import _ensure_codex_session
+        from agent.transports import codex_app_server_session as sess_mod
+        monkeypatch.setattr(rp, "load_config", lambda: {
+            "providers": {"my-gateway": {"api": "https://gateway.example.com/v1", "api_key": "sk-secret"}}})
+        clients: list[FakeClient] = []
+
+        def build(**kw):
+            clients.append(FakeClient())
+            return CodexAppServerSession(**{**kw, "client_factory": lambda **_: clients[-1]})
+        monkeypatch.setattr(sess_mod, "CodexAppServerSession", build)
+
+        def thread_start_params(**agent_attrs):
+            agent = SimpleNamespace(_codex_session=None, session_cwd="/tmp", api_key="sk-secret", **agent_attrs)
+            _ensure_codex_session(agent)
+            agent._codex_session.ensure_started()
+            return next(p for (m, p) in clients[-1].requests if m == "thread/start")
+
+        named = thread_start_params(provider="custom", requested_provider="custom:my-gateway", model="gpt-5.4")
+        # ``personality: "none"`` rides on every thread/start (#72104); only the provider selection varies.
+        base = {"cwd": "/tmp", "personality": "none"}
+        assert named == {**base, "modelProvider": "my-gateway", "model": "gpt-5.4"}
+        assert "sk-secret" not in repr(named)
+        assert thread_start_params(provider="openai-codex", requested_provider="openai-codex", model="gpt-5.4") == base
+        assert thread_start_params(provider="custom", requested_provider="custom", model="gpt-5.4") == base
 
     def test_close_idempotent(self):
         client = FakeClient()

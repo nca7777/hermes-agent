@@ -5,7 +5,7 @@ sidebar_label: Codex App-Server Runtime
 
 # Codex App-Server Runtime
 
-Hermes can optionally hand `openai/*` and `openai-codex/*` turns to the [Codex CLI app-server](https://github.com/openai/codex) instead of running its own tool loop. When enabled, terminal commands, file edits, sandboxing, and MCP tool calls all execute inside Codex's runtime — Hermes becomes the shell around it (sessions DB, slash commands, gateway, memory and skill review).
+Hermes can optionally hand `openai/*`, `openai-codex/*` and [named custom provider](#named-custom-providers) turns to the [Codex CLI app-server](https://github.com/openai/codex) instead of running its own tool loop. When enabled, terminal commands, file edits, sandboxing, and MCP tool calls all execute inside Codex's runtime — Hermes becomes the shell around it (sessions DB, slash commands, gateway, memory and skill review).
 
 This is **opt-in only**. Default Hermes behavior is unchanged unless you flip the flag. Hermes never auto-routes you onto this runtime.
 
@@ -133,7 +133,8 @@ The kanban tools are gated by `HERMES_KANBAN_TASK` env var the dispatcher sets �
 | Kanban worker dispatch | yes | yes (via callback) |
 | Kanban orchestrator tools | yes | yes (via callback) |
 | All gateway platforms | yes | yes |
-| Non-OpenAI providers | yes | n/a — OpenAI/Codex-scoped |
+| Named custom providers (`providers.<name>`) | yes | yes — a matching `[model_providers.<name>]` in `~/.codex/config.toml` is required |
+| Other non-OpenAI providers | yes | n/a — not routed through codex |
 
 ### Live display
 
@@ -162,6 +163,35 @@ uses:
    codex login                  # writes tokens to ~/.codex/auth.json
    ```
    Hermes' own `hermes auth add openai-codex` writes to `~/.hermes/auth.json` — that's a separate session. **Run `codex login` separately** if you haven't.
+
+   <a id="named-custom-providers"></a>**Or: a named custom provider.** A `providers.<name>` entry in Hermes config can use this runtime when the **same name** is defined as a Codex provider. Hermes config:
+
+   ```yaml
+   providers:
+     my-gateway:
+       api: https://gateway.example.com/v1
+       key_env: MY_GATEWAY_API_KEY
+       default_model: gpt-5.4
+
+   model:
+     provider: custom:my-gateway
+     default: gpt-5.4
+     openai_runtime: codex_app_server
+   ```
+
+   and the matching table in `~/.codex/config.toml`:
+
+   ```toml
+   [model_providers.my-gateway]
+   name = "My Gateway"
+   base_url = "https://gateway.example.com/v1"
+   env_key = "MY_GATEWAY_API_KEY"
+   wire_api = "responses"
+   ```
+
+   Hermes sends only `model` and `modelProvider = "my-gateway"` on `thread/start`; codex resolves `base_url` and reads the key from `env_key` in its own environment. **Hermes never forwards the API key**, so `MY_GATEWAY_API_KEY` must be present in the process environment Hermes runs in — `~/.hermes/.env` is loaded at startup and provider credentials are inherited by the codex subprocess. Auxiliary calls (titles, compression, memory review) still use Hermes' own `providers.my-gateway` entry.
+
+   Caveats: the name after `custom:` is the `providers:` config key and must match the `[model_providers.<name>]` table name exactly — if it does not exist on the codex side, codex reports an unknown provider rather than silently using the Hermes endpoint. Anonymous `provider: custom` (a bare `base_url`) is not eligible: it has no stable name to hand to codex, so it stays on Hermes' standard runtime.
 
 3. **(Optional) Install the Codex plugins you want.** When you enable the runtime, Hermes auto-migrates whichever curated plugins you've already installed via Codex CLI:
    ```bash

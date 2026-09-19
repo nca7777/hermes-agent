@@ -125,6 +125,9 @@ DEFAULT_CONFIG = {
         # turn), "cold" (first turn of a session only).
         "service_tier": "",
         "fast_auto_seconds": 60,
+        # Responses API final-answer length (`text.verbosity`): "" = not sent (provider default),
+        # or low | medium | high. Responses-family transports only; chat_completions never sends it.
+        "text_verbosity": "",
         # System-prompt guidance telling the model to call tools instead of describing actions.
         # "auto" = gpt/codex models; true/false = force for all models; or a list of model-name
         # substrings (e.g. ["gpt", "codex", "gemini", "qwen"]).
@@ -1031,6 +1034,11 @@ DEFAULT_CONFIG = {
         # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" |
         # "gemini" | "deepinfra" | "neutts" (local) | "kittentts" (local) | "piper" (local)
         "provider": "edge",
+        "streaming": {
+            # Shortest first sentence (chars) spoken on its own by streaming TTS; shorter openers
+            # ride with the next sentence. 20 suits English; CJK voice setups use ~6.
+            "min_len": 20,
+        },
         "edge": {
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
             "voice": "en-US-AriaNeural",

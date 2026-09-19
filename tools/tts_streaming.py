@@ -73,6 +73,16 @@ class SentenceChunker:
         self.min_len = min_len
         self.buf = ""
 
+    @classmethod
+    def from_config(cls, tts_config: Dict) -> "SentenceChunker":
+        """Chunker honouring ``tts.streaming.min_len``. 20 suits English; a CJK opener of 5–7
+        characters is a whole clause, so voice setups lower it to speak the first sentence
+        alone instead of buffering it behind the second. Floor 1: 0 would emit every boundary."""
+        try:
+            return cls(min_len=max(1, int((tts_config.get("streaming") or {}).get("min_len", 20))))
+        except (AttributeError, TypeError, ValueError):  # non-mapping / non-numeric → default
+            return cls()
+
     def feed(self, delta: str) -> List[str]:
         """Absorb *delta*; return every complete sentence now ready to speak."""
         self.buf = _THINK_BLOCK_RE.sub("", self.buf + delta)

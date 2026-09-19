@@ -200,11 +200,16 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        model: Optional[str] = None, model_provider: Optional[str] = None,
         developer_instructions: Optional[str] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        # ``thread/start.model`` / ``.modelProvider``: select a provider from codex's own
+        # ``[model_providers.<id>]`` table. Only the id travels; codex reads base_url/env_key itself.
+        self._model = (model or "").strip() or None
+        self._model_provider = (model_provider or "").strip() or None
         # Hermes' composed system prompt (SOUL.md, memory, channel overrides). Sent ONCE per thread as
         # ``thread/start.developerInstructions``: codex keeps its own base instructions (tool guidance) and
         # inserts this as the first developer message of every model request. ``baseInstructions`` would
@@ -242,6 +247,10 @@ class CodexAppServerSession:
         params: dict[str, Any] = {"cwd": self._cwd, "personality": "none"}
         if self._developer_instructions and self._developer_instructions.strip():
             params["developerInstructions"] = self._developer_instructions
+        if self._model_provider:
+            params["modelProvider"] = self._model_provider
+        if self._model:
+            params["model"] = self._model
         result = self._client.request("thread/start", params, timeout=15)
         # Different codex versions serialize the id under thread.id / sessionId / threadId.
         thread_obj = result.get("thread") or {}
