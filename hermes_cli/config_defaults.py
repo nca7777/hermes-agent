@@ -921,7 +921,9 @@ DEFAULT_CONFIG = {
         # Per-platform: display.platforms.<platform>.runtime_footer.
         "runtime_footer": {
             "enabled": False,
-            "fields": ["model", "context_pct", "cwd"],  # order shown; drop any to hide
+            # order shown; drop any to hide. Opt-in extras: latency, served_model (alias → the
+            # deployment a routing proxy reported / Hermes' fallback route).
+            "fields": ["model", "context_pct", "cwd"],
         },
         # CLI/TUI status bar fields. Non-empty = only listed fields show (built-in order kept,
         # config controls visibility not ordering); empty = default set. Available: model,
@@ -1045,6 +1047,9 @@ DEFAULT_CONFIG = {
             # Forwarded verbatim in the request body for OpenAI-compatible servers whose cloned
             # voices demand it (400 consent_required otherwise); "" sends nothing.
             "consent_attestation": "",
+            # Raw PCM rate for streaming playback. OpenAI emits 24 kHz; a compatible endpoint that
+            # reports its rate (X-Audio-Sample-Rate header) overrides this automatically.
+            "pcm_sample_rate": 24000,
         },
         "gemini": {
             "model": "gemini-2.5-flash-preview-tts",
@@ -2123,6 +2128,12 @@ DEFAULT_CONFIG = {
             # /v1/runs beyond this get HTTP 429 + Retry-After, bounding CPU/memory/LLM-quota
             # exhaustion from a request flood. 0 = no cap.
             "max_concurrent_runs": 10,
+            # Cap (chars) on each tool output and tool-call argument string in the stored
+            # /v1/responses conversation history used for previous_response_id chaining. The
+            # stored history is cumulative, so a few large tool outputs can make one
+            # response_store.db write several hundred KB. 0 = store tool outputs verbatim
+            # (default: the capped text is what the model is replayed on the next turn).
+            "history_tool_output_max_chars": 0,
         },
     },
     # Real-time token streaming to messaging platforms (gateway; restart after enabling). Off by

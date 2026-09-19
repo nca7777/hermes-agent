@@ -1234,6 +1234,12 @@ def _reasoning_config_for_wire(agent):
     """
     cfg = agent.reasoning_config
     ephemeral_off = _consume_ephemeral_reasoning_off(agent)
+    if getattr(agent, "_reasoning_effort_rejected", False):
+        # The route rejected the configured reasoning LEVEL itself (#100536: ``reasoning.effort:
+        # max`` on an enabled config). Omit the reasoning fields for the rest of the session —
+        # the route default — as the auxiliary ladder does; resending would 400 identically.
+        agent._wire_reasoning_config = None
+        return None
     if getattr(agent, "_reasoning_disable_rejected", False):
         # The route rejects disables. Resend exactly what the session has
         # been sending — the user's own config — so the retry lands on the
@@ -1248,11 +1254,18 @@ def _reasoning_config_for_wire(agent):
         ):
             if getattr(agent, "_reasoning_floor_required", False):
                 from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
-                return {**cfg, "enabled": True, "effort": REASONING_FLOOR_EFFORT}
+                floored = {**cfg, "enabled": True, "effort": REASONING_FLOOR_EFFORT}
+                agent._wire_reasoning_config = floored
+                return floored
+            agent._wire_reasoning_config = None
             return None
+        agent._wire_reasoning_config = cfg
         return cfg
     if ephemeral_off:
         cfg = {**(cfg or {}), "enabled": False, "effort": "none"}
+    # What actually went out: the reasoning-rejection rung reads it to tell a rejected
+    # disable (drop the disable) from a rejected level (drop the reasoning fields).
+    agent._wire_reasoning_config = cfg
     return cfg
 
 
