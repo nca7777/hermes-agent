@@ -2,11 +2,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.message_sanitization import coerce_tool_name
 from agent.codex_responses_adapter import (
     _chat_content_to_responses_parts,
     _chat_messages_to_responses_input,
     _classify_responses_issuer,
-    _sanitize_replayed_fn_name,
     _format_responses_error,
     _normalize_codex_response,
     _neutralize_harmony_tokens,
@@ -91,6 +91,75 @@ def test_chat_content_keeps_images_on_user_role():
         "image_url": "https://example.invalid/p.png",
         "detail": "high",
     }]
+
+
+_SVG_DATA_URL = "data:image/svg+xml;base64,PHN2Zy8+"
+_PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgo="
+
+
+def _no_rasterizer(monkeypatch):
+    import tools.vision_tools_image_prep as prep
+    monkeypatch.setattr(prep, "_rasterize_svg_to_png", lambda svg_path, out_path: False)
+
+
+def test_unsupported_inline_image_downgrades_to_text_in_message_and_tool_output(monkeypatch):
+    """#29711: a data:image/svg+xml part 400s the whole Codex request ('does not represent a valid
+    image') on every replay. Both carriers — user message content and the persisted vision_analyze
+    function_call_output — must send a text placeholder while the valid PNG still goes as input_image."""
+    _no_rasterizer(monkeypatch)
+    messages = [
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": _PNG_DATA_URL, "detail": "high"}},
+            {"type": "image_url", "image_url": {"url": _SVG_DATA_URL}},
+        ]},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_v1", "type": "function", "function": {"name": "vision_analyze", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_v1", "content": [
+            {"type": "text", "text": "rendered"}, {"type": "image_url", "image_url": {"url": _SVG_DATA_URL}}]},
+    ]
+    items = _chat_messages_to_responses_input(messages)
+    user, tool_output = items[0], items[-1]
+    assert user["content"] == [
+        {"type": "input_image", "image_url": _PNG_DATA_URL, "detail": "high"},
+        {"type": "input_text", "text": "[image omitted: image/svg+xml is not a supported image format]"},
+    ]
+    assert tool_output["type"] == "function_call_output"
+    assert [p["type"] for p in tool_output["output"]] == ["input_text", "input_text"]
+    assert "image/svg+xml" in tool_output["output"][1]["text"]
+    # ``image/jpg`` is the JPEG alias every other image site accepts — it must still go as input_image.
+    jpg = _chat_content_to_responses_parts([{"type": "image_url", "image_url": "data:image/jpg;base64,/9j/4AAQ"}])
+    assert jpg == [{"type": "input_image", "image_url": "data:image/jpg;base64,/9j/4AAQ"}]
+
+
+def test_inline_svg_is_rasterized_to_png_when_a_rasterizer_exists(monkeypatch):
+    """#29711 follow-up: with a rasterizer installed the model still sees the drawing — the SVG part
+    goes out as a PNG input_image instead of the text placeholder; the SVG itself is never sent."""
+    import tools.vision_tools_image_prep as prep
+
+    def fake_rasterize(svg_path, out_path):
+        assert svg_path.read_bytes() == b"<svg/>"
+        out_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        return True
+    monkeypatch.setattr(prep, "_rasterize_svg_to_png", fake_rasterize)
+    parts = _chat_content_to_responses_parts(
+        [{"type": "image_url", "image_url": {"url": _SVG_DATA_URL, "detail": "high"}}], role="user")
+    assert parts == [{"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo=", "detail": "high"}]
+
+
+def test_preflight_downgrades_unsupported_inline_image_but_keeps_remote_urls(monkeypatch):
+    """The preflight validator is the last seam before the wire: an svg data URL in already
+    Responses-shaped input becomes text; https URLs are the provider's to validate and pass through."""
+    _no_rasterizer(monkeypatch)
+    items = _preflight_codex_input_items([
+        {"role": "user", "content": [
+            {"type": "input_image", "image_url": _SVG_DATA_URL},
+            {"type": "input_image", "image_url": "https://example.invalid/p.svg"},
+        ]},
+        {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "input_image", "image_url": _SVG_DATA_URL}]},
+    ])
+    assert [p["type"] for p in items[0]["content"]] == ["input_text", "input_image"]
+    assert items[0]["content"][1]["image_url"] == "https://example.invalid/p.svg"
+    assert items[1]["output"] == [{"type": "input_text", "text": "[image omitted: image/svg+xml is not a supported image format]"}]
 
 
 @pytest.mark.parametrize("part_type", ["video_url", "video", "input_video"])
@@ -424,27 +493,27 @@ def test_chat_messages_to_responses_input_keeps_short_call_id():
     assert output["call_id"] == "call_abc123"
 
 
-def test_sanitize_replayed_fn_name_valid_passthrough():
+def test_coerce_tool_name_valid_passthrough():
     """Valid names pass through unchanged (identity — cache-prefix safe)."""
     for name in ("web_search", "exec-command", "a1_B2-c3", "x" * 64):
-        assert _sanitize_replayed_fn_name(name) == name
+        assert coerce_tool_name(name) == name
 
 
-def test_sanitize_replayed_fn_name_coerces_invalid_chars():
-    assert _sanitize_replayed_fn_name("exec.command") == "exec_command"
-    assert _sanitize_replayed_fn_name("run shell cmd") == "run_shell_cmd"
-    assert _sanitize_replayed_fn_name("weird..__name") == "weird_name"
-    assert _sanitize_replayed_fn_name("  tool!  ") == "tool"
+def test_coerce_tool_name_coerces_invalid_chars():
+    assert coerce_tool_name("exec.command") == "exec_command"
+    assert coerce_tool_name("run shell cmd") == "run_shell_cmd"
+    assert coerce_tool_name("weird..__name") == "weird_name"
+    assert coerce_tool_name("  tool!  ") == "tool"
 
 
-def test_sanitize_replayed_fn_name_degenerate_inputs():
+def test_coerce_tool_name_degenerate_inputs():
     """All-invalid / non-string names degrade to a placeholder, never empty —
     an empty name would trade the API 400 for a preflight ValueError."""
-    assert _sanitize_replayed_fn_name("") == "fn"
-    assert _sanitize_replayed_fn_name("...") == "fn"
-    assert _sanitize_replayed_fn_name("日本語") == "fn"
-    assert _sanitize_replayed_fn_name(None) == "fn"
-    assert len(_sanitize_replayed_fn_name("a." * 100)) <= 64
+    assert coerce_tool_name("", fallback="fn") == "fn"
+    assert coerce_tool_name("...", fallback="fn") == "fn"
+    assert coerce_tool_name("日本語", fallback="fn") == "fn"
+    assert coerce_tool_name(None, fallback="fn") == "fn"
+    assert len(coerce_tool_name("a." * 100)) <= 64
 
 
 def test_chat_messages_to_responses_input_sanitizes_replayed_fn_name():
@@ -822,6 +891,50 @@ def test_preflight_passes_native_web_search_tool_through():
 def test_format_responses_error_message_only():
     err = {"message": "Upstream model unavailable"}
     assert _format_responses_error(err, "failed") == "Upstream model unavailable"
+
+
+def _final_text_response(text):
+    return SimpleNamespace(
+        status="completed", incomplete_details=None, output_text=text,
+        output=[SimpleNamespace(
+            type="message", role="assistant", status="completed", id="msg_1",
+            content=[SimpleNamespace(type="output_text", text=text)],
+        )],
+    )
+
+
+@pytest.mark.parametrize("text", [
+    'Creating the PowerShell script now.\n{"cmd": "mkdir -p /c/Temp && cat > /c/Temp/x.ps1 <<\'EOF\'"}',
+    'Sure, let me run the tests.\n{"cmd": "pytest -q", "workdir": "/repo", "timeout": 120}',
+    'Next, I\'ll create the script.\n{"cmd": "cat > x.sh"}',
+    'Okay — running the tests.\n{"cmd": "pytest -q"}',
+    "Calling tool now to=functions.terminal {\"command\": \"ls\"}",
+])
+def test_normalize_codex_response_treats_leaked_tool_call_text_as_incomplete(text):
+    """#56920: Codex-CLI shell JSON (or Harmony ``to=functions``) leaked as assistant text is a failed tool call,
+    not a final answer — classify incomplete so the continuation re-elicits a structured ``function_call``, and
+    drop the message items so the leak is never replayed as a completed assistant turn."""
+    assistant_message, finish_reason = _normalize_codex_response(_final_text_response(text), issuer_kind="codex_backend")
+
+    assert finish_reason == "incomplete"
+    assert assistant_message.content == ""
+    assert assistant_message.tool_calls == []
+    assert assistant_message.codex_message_items is None
+
+
+@pytest.mark.parametrize("text", [
+    'Here is the JSON payload the CLI expects:\n{"cmd": "mkdir -p /c/Temp"}',
+    '{"cmd": "ls"}',
+    'Creating the file now.\n{"cmd": "ls"}\nDone — the file is in place.',
+])
+def test_normalize_codex_response_keeps_legitimate_cmd_json_answer(text):
+    """#56920 false-positive guard: ``{"cmd": ...}`` without an action lead-in, or not closing the message,
+    is an answer about JSON and stays a completed response with its replay items intact."""
+    assistant_message, finish_reason = _normalize_codex_response(_final_text_response(text), issuer_kind="codex_backend")
+
+    assert finish_reason == "stop"
+    assert assistant_message.content == text
+    assert assistant_message.codex_message_items
 
 
 def test_normalize_codex_response_failed_includes_code_in_error():

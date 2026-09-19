@@ -228,6 +228,7 @@ model:
 Important behaviour:
 
 - **GPT-5.x, codex, and o-series auto-route to the Responses API.** Microsoft Foundry deploys GPT-5 / codex / o1 / o3 / o4 models as Responses-API-only — calling `/chat/completions` against them returns `400 "The requested operation is unsupported."`. Hermes detects these model families by name and upgrades `api_mode` to `codex_responses` transparently, even when `config.yaml` still reads `api_mode: chat_completions`. GPT-4, GPT-4o, Llama, Mistral, and other deployments stay on `/chat/completions`.
+- **`api_mode: responses` is accepted as a spelling of `codex_responses`.** The alias works on `model.api_mode`, on `fallback_providers` entries and on per-task `auxiliary.<task>.api_mode` (e.g. an `auxiliary.vision` route to a GPT-5.x deployment), and selects the same Responses adapter.
 - **`max_completion_tokens` is used automatically.** Azure OpenAI (like direct OpenAI) requires `max_completion_tokens` for gpt-4o, o-series, and gpt-5.x models. Hermes sends the right parameter based on the endpoint.
 - **Pre-v1 endpoints that require `api-version`.** If you have a legacy base URL like `https://<resource>.openai.azure.com/openai?api-version=2025-04-01-preview`, Hermes extracts the query string and forwards it via `default_query` on every request (the OpenAI SDK otherwise drops it when joining paths).
 
@@ -274,11 +275,24 @@ Azure does **not** expose a pure-API-key endpoint to list your *deployed* model 
 
 What Hermes can do:
 
-- Azure OpenAI v1 endpoints (`<resource>.openai.azure.com/openai/v1`) expose `GET /models` with the resource's **available** model catalog. Hermes uses this list to prefill the model picker.
-- Microsoft Foundry `/anthropic` routes: detected via URL path, model name entered manually.
+- Azure OpenAI v1 endpoints (`<resource>.openai.azure.com/openai/v1`) expose `GET /models` with the resource's **available** model catalog. Hermes uses this list to prefill the setup wizard's model picker **and** the in-session `/model azure-foundry` picker (CLI, TUI, Desktop, gateway), so you can switch deployments without re-running `hermes setup`.
+- Microsoft Foundry `/anthropic` routes: detected via URL path, model name entered manually (no `/models` there — the `/model` picker shows only the current selection and any `providers.azure-foundry.models` you declare).
 - Private / firewalled endpoints: manual entry with a friendly "couldn't probe" message.
+- Entra ID (`model.auth_mode: entra_id`, no `AZURE_FOUNDRY_API_KEY`): the `/model` picker lists the provider as soon as `model.base_url` (or `AZURE_FOUNDRY_BASE_URL`) is set — no token is minted just to show the row.
 
 You can always type a deployment name directly — Hermes does not validate against the returned list.
+
+To pin the picker to the deployments you actually use (the catalog can be long), or to list them for an endpoint without `/models`, declare them in `config.yaml`; they are listed first, ahead of the live catalog:
+
+```yaml
+providers:
+  azure-foundry:
+    models:
+      - gpt-5.4
+      - kimi-k2.6
+```
+
+The runtime picker resolves the endpoint from `model.base_url` while Azure Foundry is the active provider; set `AZURE_FOUNDRY_BASE_URL` as well if you want the row to stay populated after switching to another provider.
 
 ## Environment variables
 

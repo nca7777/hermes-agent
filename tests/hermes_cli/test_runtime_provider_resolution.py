@@ -110,6 +110,33 @@ def test_codex_pool_honors_hermes_codex_base_url(monkeypatch):
     assert resolved["base_url"] == "http://127.0.0.1:8787/v1"
 
 
+def test_codex_pool_honors_model_base_url(monkeypatch):
+    """#40913: model.base_url under provider openai-codex is the secondary proxy override; the
+    canonical URL stored on the pool row must not shadow it."""
+    class _Entry:
+        access_token = "pool-token"
+        source = "manual"
+        base_url = "https://chatgpt.com/backend-api/codex"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self, **_kwargs):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.delenv("HERMES_CODEX_BASE_URL", raising=False)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+        "provider": "openai-codex", "default": "gpt-5.3-codex", "base_url": "http://127.0.0.1:8400/backend-api/codex/"})
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["base_url"] == "http://127.0.0.1:8400/backend-api/codex"
+    assert resolved["api_mode"] == "codex_responses"
+
+
 class TestCustomProviderPoolLoopbackNoKeyExemption:
     """Regression for issue #86864: legacy custom_providers configs often
     used short/placeholder api_keys ('123', 'm') for local no-auth
@@ -1151,6 +1178,28 @@ def test_opencode_go_resolution_heals_a_stale_zen_config_base_url(monkeypatch):
 
     assert resolved["api_mode"] == "chat_completions"
     assert resolved["base_url"] == "https://opencode.ai/zen/go/v1"
+
+
+@pytest.mark.parametrize("model", ["qwen3.8-flash", "glm-5.3-flash"])
+def test_opencode_go_explicit_key_matches_env_key_route(monkeypatch, model):
+    """#100854: an explicit ``--api-key`` must not change which OpenCode endpoint a model
+    reaches. The explicit-credential rung used to derive api_mode from config instead of the
+    model and skipped the /v1 normalization, so ``qwen3.8-flash`` (Anthropic-routed) was sent
+    to ``/zen/go/v1`` over chat_completions and 404'd, while the env-key rung routed it right.
+    Both rungs must agree on (api_mode, base_url) for every model.
+    """
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "opencode-go")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "opencode-go", "default": "glm-5.3-flash"})
+    monkeypatch.delenv("OPENCODE_GO_BASE_URL", raising=False)
+
+    monkeypatch.delenv("OPENCODE_GO_API_KEY", raising=False)
+    explicit = rp.resolve_runtime_provider(requested="opencode-go", explicit_api_key="test-opencode-go-key", target_model=model)
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "test-opencode-go-key")
+    env_key = rp.resolve_runtime_provider(requested="opencode-go", target_model=model)
+
+    assert explicit["source"] == "explicit"
+    assert (explicit["api_mode"], explicit["base_url"]) == (env_key["api_mode"], env_key["base_url"])
+    assert explicit["api_mode"] == rp._models.opencode_model_api_mode("opencode-go", model)
 
 
 # ------------------------------------------------------------------

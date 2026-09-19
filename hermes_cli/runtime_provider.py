@@ -492,6 +492,10 @@ def _pool_entry_mode_and_url(provider, entry, model_cfg, effective_model, base_u
             override_url = get_secret_str("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
             if override_url:
                 return api_mode, override_url
+            # model.base_url is the secondary proxy override (same rule as the generic tail below:
+            # only when the pool row still carries the canonical URL).
+            if base_url in ("", default_url):
+                base_url = _config_base_url_for_provider(model_cfg, provider) or base_url
         return api_mode, base_url or (default_url() if callable(default_url) else default_url)
     if provider == "anthropic":
         return "anthropic_messages", _anthropic_cfg_base_url(model_cfg) or base_url or _ANTHROPIC_DEFAULT_BASE_URL
@@ -650,7 +654,8 @@ def _explicit_api_key_provider(provider, pconfig, requested_provider, model_cfg,
         if not base_url:
             base_url = _actual_url(provider, creds.get("base_url", "").rstrip("/"))
     api_mode = _api_key_provider_api_mode(provider, model_cfg, api_key, base_url, target_model or model_cfg.get("default", ""),
-                                          opencode_by_model=False)
+                                          opencode_by_model=True)
+    base_url = _finalize_base_url(provider, api_mode, base_url)
     api_key = _actual_local_key(provider, api_key, base_url)
     return _runtime(provider, api_mode, base_url.rstrip("/"), api_key, source="explicit", requested_provider=requested_provider)
 
@@ -1019,3 +1024,55 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
     warn_once(__name__, name, *target)
     return getattr(importlib.import_module(target[0]), target[1])
 # ---- END PLUGIN-COMPAT ----
+
+
+def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested: Optional[str] = None,
+                                  target_model: Optional[str] = None, explicit_base_url: Optional[str] = None,
+                                  explicit_api_key: Optional[str] = None,
+                                  ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """``resolve_runtime_provider`` plus resolution-time fallback: ``(runtime, fallback_entry_or_None)``.
+
+    Only an ``AuthError`` from the primary (missing/expired credentials, exhausted quota, cooled-down pool)
+    walks ``get_fallback_chain(config)`` in order and returns the first entry that resolves — the single
+    resolution-time walker shared by the gateway and oneshot. ``ValueError``/other errors are genuine
+    misconfiguration (unknown ``--provider`` ...) and propagate unchanged, so a typo is never silently
+    rerouted onto a provider the operator did not ask for. When every entry fails, the *primary* error is
+    re-raised: a fallback entry's failure is not what the operator configured first (#81209). The entry's
+    ``model`` is the model the caller must send.
+    """
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    try:
+        return resolve_runtime_provider(requested=requested, target_model=target_model,
+                                        explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
+    except AuthError as primary_exc:
+        from hermes_cli.fallback_config import effective_runtime_provider, get_fallback_chain, resolve_entry_api_key
+        for entry in get_fallback_chain(config):
+            provider = (entry.get("provider") or "").strip().lower()
+            model = (entry.get("model") or "").strip()
+            if not provider or not model:
+                continue
+            kwargs: Dict[str, Any] = {"requested": provider, "target_model": model}
+            if entry.get("base_url"):
+                kwargs["explicit_base_url"] = entry["base_url"]
+            if entry_key := resolve_entry_api_key(entry):
+                kwargs["explicit_api_key"] = entry_key
+            try:
+                runtime = resolve_runtime_provider(**kwargs)
+            except AuthError as fb_exc:
+                logger.debug("Fallback entry %s/%s failed: %s", provider, model, fb_exc)
+                continue
+            except Exception as fb_exc:
+                # Not a credential problem: a mistyped provider/base_url must be visible, not silently skipped.
+                logger.warning("Fallback entry %s/%s is misconfigured and was skipped: %s", provider, model, fb_exc)
+                continue
+            # Named custom entries resolve to the bare "custom" class; persist the configured identity (#98739).
+            runtime["provider"] = effective_runtime_provider(entry, runtime)
+            # A rate-limit/quota cap is transient (credentials are fine, re-auth cannot help); the log must not
+            # mislabel it as an auth failure (#32790).
+            if is_rate_limited_auth_error(primary_exc):
+                logger.warning("Primary provider rate-limited (429): %s. Falling back to %s/%s",
+                               primary_exc, provider, model)
+            else:
+                logger.warning("Primary provider auth failed (%s). Falling back to %s/%s", primary_exc, provider, model)
+            return runtime, entry
+        raise primary_exc

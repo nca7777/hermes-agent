@@ -107,6 +107,11 @@ DEFAULT_CONFIG = {
         # whole call; the OpenAI SDK also retries transient errors (max_retries=2). Set 1 for fast
         # failover to fallback providers; raise to tolerate longer provider hiccups.
         "api_max_retries": 3,
+        # Seconds the Codex/Responses stream may keep reading after its terminal frame so the relay
+        # finalizer can run. Relays that never close the SSE socket after response.completed would
+        # otherwise wedge the turn until the idle watchdog discards the already-billed response
+        # (#103864). 0 skips the drain. Well-behaved endpoints close immediately and never wait this long.
+        "stream_drain_timeout": 2.0,
         # Empty-response retry guard. Empty retries re-send the full input at full price; this stops
         # re-billing deterministic empties (unsignaled refusals, zero output tokens) while failing
         # open on ambiguous evidence (missing usage, any tokens, model/provider change).
@@ -709,8 +714,11 @@ DEFAULT_CONFIG = {
         # OpenAI-compatible request fields. Vision: download_timeout = image HTTP download (s).
         "vision": _aux(120, download_timeout=30),
         # web_extract and session_search no longer use an aux LLM; leftover blocks in user config
-        # are ignored. Compression: raise timeout for local models.
-        "compression": _aux(120),
+        # are ignored. Compression: raise timeout for local models. no_progress_timeout
+        # (Codex/Responses streams only): seconds without a substantive event before the stream
+        # fails fast; None = built-in 60s default. Independent of "timeout" (the overall request
+        # budget) — raising "timeout" alone does not widen this window. See #108104.
+        "compression": _aux(120, no_progress_timeout=None),
         "skills_hub": _aux(30),
         "approval": _aux(30),   # classifier — a fast/cheap model is recommended
         # /review reviewer: a full subagent on the async delegation rail, credentials resolved like
@@ -1034,6 +1042,9 @@ DEFAULT_CONFIG = {
             # gpt-4o-mini-tts voices: alloy, ash, ballad, cedar, coral, echo, fable, marin, nova,
             # onyx, sage, shimmer, verse
             "voice": "alloy",
+            # Forwarded verbatim in the request body for OpenAI-compatible servers whose cloned
+            # voices demand it (400 consent_required otherwise); "" sends nothing.
+            "consent_attestation": "",
         },
         "gemini": {
             "model": "gemini-2.5-flash-preview-tts",
@@ -1118,6 +1129,8 @@ DEFAULT_CONFIG = {
             # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe, gpt-transcribe
             "model": "whisper-1",
             "language": "",  # auto-detect; set "en", "es", ... to force
+            "timeout": 60,  # seconds; allow self-hosted backends time to cold-start
+            "max_retries": 1,  # OpenAI SDK transport retries
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
