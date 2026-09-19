@@ -520,6 +520,10 @@ redirect here.
 
 If a Desktop chat or bot stops responding while the connection still shows **Connected**, select that bot/profile or gateway, open the status bar's gateway menu, and click **Reconnect gateway**. Reconnect stays available for open, connecting, and disconnected transports. It redials the active route without restarting Desktop or deliberately closing other routes' sockets. In-flight requests on the selected socket can be interrupted; this is an explicit recovery action, not a backend or model restart.
 
+### The app vanished after `hermes update`
+
+An earlier update that replaced the checkout without keeping `apps/desktop/release/` leaves no packaged app to launch. As long as `HERMES_HOME/desktop-build-stamp.json` (written only by a successful Desktop build) still exists, the next `hermes update` notices the missing app and rebuilds it. To rebuild by hand: `hermes desktop --build-only --force-build`. On Windows the ZIP fallback also keeps the built app, its renderer bundle and its Electron `node_modules` across the swap.
+
 ### The local backend stopped in the background
 
 If the local Hermes backend process exits after it was ready, Desktop restarts it on its own and shows a **Hermes stopped working in the background** notice; the chat reconnects once the replacement is up. `HERMES_HOME/logs/desktop.log` records the exit code together with the backend's last output lines (`Hermes backend exited (1)` followed by `Recent backend output:`), so the reason it died is in the log even when the app recovered by itself. A backend that keeps dying within seconds of every restart points at the backend itself — look at the traceback in that tail. After three such restarts within two minutes Desktop stops respawning and shows a **keeps crashing** notice instead of cycling; relaunch the app once the cause is fixed.
@@ -592,7 +596,7 @@ clearing the entry — the latch resets and the next boot dials fresh.
 
 The build downloads the Electron runtime (~114&nbsp;MB) from `github.com/electron/electron/releases`. If the installer hangs on the **Build desktop app** step with the live output repeating `retrying attempt=…`, GitHub is being blocked or throttled on your network (firewall, proxy, or region).
 
-The installer self-heals this automatically: on a failed build it (1) clears a corrupt cached Electron zip and retries, then (2) if it still fails and you haven't set `ELECTRON_MIRROR`, retries once more through `npmmirror.com`, the de-facto Electron community mirror. `@electron/get` SHASUM-checks the download, but the checksums come from the same mirror — that catches a corrupt or partial download, not a compromised mirror. If you'd rather not trust a third-party host, pin your own `ELECTRON_MIRROR` (below); the build never overrides one you've set.
+The installer self-heals this automatically: on a failed build it (1) clears a corrupt cached Electron zip and retries, then (2) if it still fails, the Electron distributable is still missing, and you haven't set `ELECTRON_MIRROR`, retries once more through `npmmirror.com`, the de-facto Electron community mirror. `@electron/get` SHASUM-checks the download, but the checksums come from the same mirror — that catches a corrupt or partial download, not a compromised mirror. If you'd rather not trust a third-party host, pin your own `ELECTRON_MIRROR` (below); the build never overrides one you've set.
 
 To **choose your own mirror** (e.g. a corporate/trusted one), set `ELECTRON_MIRROR` before installing or rebuild manually — the build honors it and won't override it:
 
@@ -602,6 +606,8 @@ ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ \
 ```
 
 **Other native downloads (e.g. the `get-windows` prebuilt on Windows) that need a mirror:** put the npm keys in `$HERMES_HOME/npmrc` (`%LOCALAPPDATA%\hermes\npmrc` on Windows, `~/.hermes/npmrc` elsewhere) — for example `node_get_windows_binary_host_mirror=https://<mirror>/sindresorhus/get-windows/releases/download/`. Every `npm ci`/`npm run` the updater spawns (desktop, web and TUI builds) points `NPM_CONFIG_USERCONFIG` at that file when it exists, so the config survives `hermes update`; the repo-root `.npmrc` is git-tracked and gets autostashed on every update, and `~/.npmrc` may be missed because the desktop hand-off inherits the GUI's environment. An `NPM_CONFIG_USERCONFIG` you set yourself is never overridden.
+
+**If `get-windows` is missing or half-installed:** the build no longer fails — it prints `[stage-native-deps] get-windows not installed ... read_window_below will be unavailable in this build` and ships without the `read_window_below` tool. When the package directory exists but is not loadable (a Windows in-place update interrupted by a running Hermes window, `TAR_ENTRY_ERROR` in the install log), the same warning names the directory, and the next `hermes desktop --force-build` or update removes it before its npm install so the package is re-extracted — close every Hermes window and gateway first so the extract is not interrupted again. A package whose native binding or macOS helper is missing is likewise shipped without window enumeration rather than failing the build.
 
 To clear a corrupt cached zip by hand:
 
