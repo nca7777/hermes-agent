@@ -258,6 +258,26 @@ class TestCodexBuildKwargs:
         assert "id" not in message_item
         assert message_item["phase"] == "final_answer"
 
+    @pytest.mark.parametrize(("is_codex_backend", "expected_user", "expected_assistant"), [
+        (True, [{"type": "input_text", "text": "hi"}], [{"type": "output_text", "text": "pong"}]),
+        (False, "hi", "pong"),  # other Responses routes keep the string shorthand they always sent
+    ], ids=["codex-typed-parts", "other-route-string"])
+    def test_codex_backend_sends_typed_text_parts_for_string_content(
+        self, transport, is_codex_backend, expected_user, expected_assistant,
+    ):
+        """#51512 (no-replay atom): the ChatGPT Codex backend 400s ``{"detail": "Unsupported content type"}``
+        on a role message whose ``content`` is a plain string, even with no reasoning replay in the request.
+        Text must go out as typed ``input_text``/``output_text`` parts; the preflight the real call runs
+        through must keep them."""
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "pong"},
+            {"role": "user", "content": "hi"},
+        ]
+        kw = transport.build_kwargs(model="gpt-5.5", messages=messages, tools=[], is_codex_backend=is_codex_backend)
+        kw = transport.preflight_kwargs(kw, sanitize_harmony_tokens=is_codex_backend)
+        assert [item["content"] for item in kw["input"]] == [expected_user, expected_assistant, expected_user]
+
     @pytest.mark.parametrize("model", [
         "gpt-5.5",
         "gpt-5.5-pro",
@@ -460,6 +480,39 @@ class TestCodexBuildKwargs:
         )
         reasoning = [item for item in kw["input"] if item.get("type") == "reasoning"]
         assert [item["encrypted_content"] for item in reasoning] == ["sealed-2"]
+
+    def test_azure_trimmed_reasoning_turn_still_drops_its_message_id(self, transport):
+        """The older turn's reasoning is trimmed for Azure (#105369) but its ``msg_*`` id is still bound to a
+        ``rs_*`` id that is no longer on the wire; the id must go with it (#97427). The newest turn's id is
+        dropped too (its reasoning replays without id); a reasoning-free turn keeps its id."""
+        def _turn(text, *, reasoning):
+            msg = {
+                "role": "assistant", "content": text,
+                "codex_message_items": [{
+                    "type": "message", "role": "assistant", "status": "completed", "id": f"msg_{text}",
+                    "content": [{"type": "output_text", "text": text}],
+                }],
+            }
+            if reasoning:
+                msg["codex_reasoning_items"] = [{"type": "reasoning", "id": f"rs_{text}", "encrypted_content": f"sealed-{text}", "summary": []}]
+            return msg
+
+        messages = [
+            {"role": "user", "content": "first"}, _turn("old", reasoning=True),
+            {"role": "user", "content": "second"}, _turn("plain", reasoning=False),
+            {"role": "user", "content": "third"}, _turn("new", reasoning=True),
+            {"role": "user", "content": "fourth"},
+        ]
+        kw = transport.build_kwargs(
+            model="gpt-6-astra", messages=messages, tools=[],
+            base_url="https://placeholder.openai.azure.com/openai/v1", replay_encrypted_reasoning=True,
+        )
+        reasoning = [i for i in kw["input"] if i.get("type") == "reasoning"]
+        assert [i["encrypted_content"] for i in reasoning] == ["sealed-new"]
+        by_text = {i["content"][0]["text"]: i for i in kw["input"] if i.get("type") == "message" and i.get("role") == "assistant"}
+        assert "id" not in by_text["old"] and "id" not in by_text["new"]
+        assert by_text["plain"]["id"] == "msg_plain"
+        assert "codex_reasoning_items" in messages[1]  # canonical history untouched
 
     def test_default_responses_new_turn_replays_all_reasoning(self, transport):
         """Non-Azure Responses endpoints keep cross-turn reasoning replay."""

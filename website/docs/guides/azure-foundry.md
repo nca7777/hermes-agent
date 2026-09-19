@@ -186,6 +186,8 @@ azure-foundry (Microsoft Entra ID):
   Status: configured; live token probe is skipped here
 ```
 
+Auxiliary tasks that follow the main model (`provider: auto` — session titles, context compression, smart approval) reuse the main session's Entra token provider instead of re-authenticating; a `--api-key` string on the CLI still overrides it for one-off testing.
+
 ### Limitations
 
 - **Anthropic-style endpoints use an httpx event hook.** The Anthropic Python SDK does not accept a callable `auth_token` natively (≤ 0.86.0). Hermes installs a request event hook on a custom `httpx.Client` that mints a fresh JWT per outbound request and rewrites `Authorization: Bearer <jwt>`. This is functionally equivalent to the OpenAI SDK's native `Callable[[], str]` contract but adds one indirection layer. If the Anthropic SDK adds first-class callable-auth support in a future release, Hermes will switch to it transparently.
@@ -248,6 +250,7 @@ Important behaviour:
 - **Bearer auth is used instead of `x-api-key`.** Azure's Anthropic-compatible route requires `Authorization: Bearer <key>` rather than Anthropic's native `x-api-key` header. Hermes detects `azure.com` in the base URL and routes the API key through the SDK's `auth_token` field so the right header reaches the upstream.
 - **1M context window beta header is kept.** Azure still gates the 1M-token Claude context (Opus 4.6/4.7, Sonnet 4.6) behind the `anthropic-beta: context-1m-2025-08-07` header. Hermes keeps that beta header on Azure paths (it's stripped from native Anthropic OAuth requests because some subscriptions reject it, but Azure requires it).
 - **OAuth token refresh is disabled.** Azure deployments use static API keys. The `~/.claude/.credentials.json` OAuth token refresh loop that applies to Anthropic Console is explicitly skipped for Azure endpoints to prevent the Claude Code OAuth token from overwriting your Azure key mid-session.
+- **`hermes doctor` probes the same route.** The `/anthropic` route has no `GET /models`, so the connectivity check sends a one-token `POST /v1/messages` with the same Bearer auth and `api-version` query the runtime uses; a 200 (or a 400 from the Messages API) reports the endpoint as healthy, 401/403 as an auth problem.
 
 ## Alternative: `provider: anthropic` + Azure base URL
 

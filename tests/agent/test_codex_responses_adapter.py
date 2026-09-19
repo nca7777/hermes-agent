@@ -12,6 +12,7 @@ from agent.codex_responses_adapter import (
     _neutralize_harmony_tokens,
     _preflight_codex_api_kwargs,
     _preflight_codex_input_items,
+    _responses_tools,
 )
 
 
@@ -20,6 +21,49 @@ _HARMONY_SOURCE_SNIPPET = (
     "Need to generate one image according to the description."
     "<|end|><|start|>assistant<|channel|>final<|message|>"
 )
+
+
+def _strict_tool(name, strict_marker=None):
+    fn = {"name": name, "parameters": {"type": "object", "properties": {}}}
+    if strict_marker is not None:
+        fn["strict"] = strict_marker
+    return {"type": "function", "function": fn}
+
+
+_STRICTNESS_TOOLS = [
+    _strict_tool("default"),
+    _strict_tool("strict", True),
+    _strict_tool("non_strict", False),
+    _strict_tool("invalid", "true"),
+]
+_EXPECTED_STRICTNESS = [("default", False), ("strict", True), ("non_strict", False), ("invalid", False)]
+
+
+def _main_transport_wire_tools():
+    from agent.transports.codex import ResponsesApiTransport
+
+    return ResponsesApiTransport().build_kwargs(
+        "gpt-5.5", [{"role": "user", "content": "hi"}], _STRICTNESS_TOOLS
+    )["tools"]
+
+
+def _auxiliary_adapter_wire_tools():
+    from agent.auxiliary_client import _CodexCompletionsAdapter
+
+    adapter = _CodexCompletionsAdapter(SimpleNamespace(base_url="https://example.com/v1"), "gpt-5.5")
+    resp_kwargs, _, _ = adapter._build_responses_kwargs(
+        {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}], "tools": _STRICTNESS_TOOLS}
+    )
+    return resp_kwargs["tools"]
+
+
+@pytest.mark.parametrize(
+    "wire_tools", [_main_transport_wire_tools, _auxiliary_adapter_wire_tools], ids=["main_transport", "auxiliary"]
+)
+def test_responses_wire_tools_preserve_explicit_boolean_strictness(wire_tools):
+    # Drives the production entry points (main-loop build_kwargs and the auxiliary adapter), not the
+    # helper: an explicit ``strict: True`` must reach kwargs["tools"] on both routes (#105401 parity).
+    assert [(item["name"], item["strict"]) for item in wire_tools()] == _EXPECTED_STRICTNESS
 
 
 def test_chat_content_drops_images_from_assistant_role():
@@ -610,6 +654,30 @@ def test_chat_messages_to_responses_input_drops_foreign_id_for_codex_backend():
     assert "id" not in codex_message
     assert codex_message["phase"] == "final_answer"
     assert xai_message["id"] == _FOREIGN_ITEM_ID
+
+
+def test_message_id_is_dropped_when_its_turn_replays_reasoning_without_id():
+    """#97427/#97442: a ``msg_*`` id bound to a stripped ``rs_*`` id is an orphan the API rejects with 400;
+    the message survives as content/status/phase. A reasoning-free turn keeps its id (prefix-cache affinity)."""
+    def _turn(text, *, reasoning):
+        msg = {
+            "role": "assistant",
+            "content": text,
+            "codex_message_items": [{
+                "type": "message", "role": "assistant", "status": "completed", "id": f"msg_{text}",
+                "phase": "final_answer", "content": [{"type": "output_text", "text": text}],
+            }],
+        }
+        if reasoning:
+            msg["codex_reasoning_items"] = [{"type": "reasoning", "id": "rs_1", "encrypted_content": "BLOB", "summary": []}]
+        return msg
+
+    items = _chat_messages_to_responses_input([_turn("linked", reasoning=True), _turn("alone", reasoning=False)])
+
+    reasoning, linked, alone = (i for i in items if i.get("type") in {"reasoning", "message"})
+    assert "id" not in reasoning and "id" not in linked
+    assert linked["phase"] == "final_answer" and linked["content"] == [{"type": "output_text", "text": "linked"}]
+    assert alone["id"] == "msg_alone"
 
 
 def _reasoning_history(item):

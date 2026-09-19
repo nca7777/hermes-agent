@@ -1736,9 +1736,19 @@ def _fallback_api_mode_hint(fb: dict, fb_provider: str, fb_base_url_hint: Option
     rewrites a dual-surface /anthropic base to /v1, losing the Anthropic wire signal. An explicit
     ``api_mode`` always wins (even "chat_completions") and suppresses later re-detection;
     ``provider: anthropic`` without a base_url still resolves to anthropic_messages."""
-    explicit = str(fb.get("api_mode") or "").strip()
+    from hermes_cli.runtime_provider import _get_named_custom_provider, _parse_api_mode
+    # Entries accept the same ``api_mode`` / ``transport`` spellings as ``providers.<name>``.
+    explicit = _parse_api_mode(fb.get("api_mode") or fb.get("transport"))
     if explicit:
         return True, explicit
+    # A named ``providers.<name>`` block declares its wire once (``api_mode``/``transport``); a
+    # fallback entry naming that provider inherits it instead of being re-detected from the host
+    # (#33062, #81932: an Anthropic-Messages or Responses-only relay on a plain host was downgraded
+    # to chat_completions while resolve_provider_client had already built the declared client).
+    if fb_provider and fb_provider not in {"custom", "moa"}:
+        declared = (_get_named_custom_provider(fb_provider) or {}).get("api_mode")
+        if declared:
+            return True, declared
     if fb_provider == "anthropic" or (fb_base_url_hint and _is_anthropic_wire_url(fb_base_url_hint)):
         return False, "anthropic_messages"
     return False, "chat_completions"
@@ -2048,7 +2058,11 @@ _EMPTY_SUMMARY_RESPONSE = "I reached the iteration limit and couldn't generate a
 
 def _iteration_summary_api_messages(agent, messages: list) -> list:
     """Wire-ready messages for the summary call, mirroring the main loop's api_messages build
-    (sidecar substitution, tool-call repair, thinking-only drop, underscore-key sweep)."""
+    (sidecar substitution, tool-call repair, thinking-only drop, underscore-key sweep).
+
+    ``reasoning_details`` is kept: the anthropic_messages converter rebuilds signed thinking
+    blocks from it, and the chat-completions transport already drops it on the wire for routes
+    that do not replay it (``_chat_summary_attempt`` -> ``_build_api_kwargs``)."""
     needs_sanitize = agent._should_sanitize_tool_calls()
     sanitize_model = agent.model
     if needs_sanitize and agent.provider == "moa":

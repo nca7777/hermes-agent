@@ -263,7 +263,8 @@ def _api_key_provider_api_mode(provider: str, model_cfg: Dict[str, Any], api_key
 
 def _maybe_apply_codex_app_server_runtime(*, provider: str, api_mode: str, model_cfg: Optional[Dict[str, Any]]) -> str:
     """Opt-in rewrite to "codex_app_server" via ``model.openai_runtime``; only ``openai`` /
-    ``openai-codex`` are eligible. No-op when unset, "auto", or empty."""
+    ``openai-codex`` are eligible. No-op when unset, "auto", or empty. Applied once, on the
+    runtime ``resolve_runtime_provider`` picked — never inside an individual ladder rung."""
     if model_cfg and provider in {"openai", "openai-codex"} and str(model_cfg.get("openai_runtime") or "").strip().lower() == "codex_app_server":
         return "codex_app_server"
     return api_mode
@@ -521,7 +522,6 @@ def _resolve_runtime_from_pool_entry(*, provider: str, entry: PooledCredential, 
     api_mode, base_url = _pool_entry_mode_and_url(provider, entry, model_cfg, _effective_model(model_cfg, target_model),
                                                   _pool_entry_base_url(entry).rstrip("/"))
     base_url = _finalize_base_url(provider, api_mode, base_url)
-    api_mode = _maybe_apply_codex_app_server_runtime(provider=provider, api_mode=api_mode, model_cfg=model_cfg)
     return _runtime(provider, api_mode, base_url, _pool_entry_api_key(entry), source=getattr(entry, "source", "pool"),
                     credential_pool=pool, requested_provider=requested_provider)
 
@@ -906,6 +906,8 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
          keyless fallback as ``auth_error``) → minimax-oauth
          → external-process → anthropic env → bedrock → registry api_key providers
       8. OpenRouter / bare-custom fallback
+      9. ``model.openai_runtime`` overlay (openai/openai-codex only): rewrites the picked rung's
+         api_mode to ``codex_app_server``; the rung's credential/endpoint is then not used
     target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
     OpenCode Zen/Go where different models route through different API surfaces)."""
     requested_provider = resolve_requested_provider(requested)
@@ -913,6 +915,15 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
     runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
     _raise_for_credentialless_bare_custom(requested_provider, runtime)
+    # model.openai_runtime is applied ONCE, after the ladder: every rung (pool, OAuth store,
+    # explicit --api-key/--base-url, env key) hardcodes the wire api_mode for openai/openai-codex,
+    # so applying the opt-in inside one rung left the others on codex_responses (#115169).
+    api_mode = _maybe_apply_codex_app_server_runtime(
+        provider=runtime.get("provider", ""), api_mode=runtime.get("api_mode", ""), model_cfg=_get_model_config())
+    if api_mode != runtime.get("api_mode"):
+        logger.info("model.openai_runtime=codex_app_server overrides the %s runtime (source=%s); its credential/endpoint "
+                    "is not used — the app-server authenticates with its own login", runtime.get("provider"), runtime.get("source"))
+    runtime["api_mode"] = api_mode
     return runtime
 
 

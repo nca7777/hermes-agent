@@ -1821,6 +1821,25 @@ The key matching is **spelling-tolerant** — any reasonable spelling will match
 - A key prefixed with a named custom provider (`ollama-local/qwen3.6:27b-q4_k_m`) also applies when the request carries only the bare model id (`qwen3.6:27b-q4_k_m`), which is what fallback entries and `providers:` routes send
 - Exact matches take precedence over variants
 
+#### Custom reasoning tier names
+
+Some OpenAI-compatible endpoints expose thinking tiers outside the standard ladder (a relay serving `fast`/`thinking` instead of `low`…`max`). A bare string outside the ladder is rejected with `Unknown reasoning_effort '<value>', using default (medium)` so a typo can never reach the wire. To request a provider's own tier name, use the explicit dict form — the `effort` value is sent verbatim as the top-level `reasoning_effort` field:
+
+```yaml
+agent:
+  reasoning_effort:
+    enabled: true
+    effort: thinking            # sent as-is
+  reasoning_overrides:
+    "my-relay/lumo-max":        # dict form works per model too
+      enabled: true
+      effort: fast
+```
+
+`enabled: false` in the dict form turns thinking off, the same as `reasoning_effort: none`.
+
+The dict form is set by editing `config.yaml` directly: the `/reasoning` menus, `hermes model`, and the dashboard's auxiliary-model pickers only offer the standard ladder (the TUI status and setup wizard still show the custom tier name once it is configured).
+
 :::note
 Model ids contain dots (`claude-opus-4.5`, `qwen3.6:27b`), which `hermes config set` treats as nesting separators. Escape them with a backslash to write the literal key — `hermes config set 'agent.reasoning_overrides.ollama-local/qwen3\.6:27b-q4_k_m' low` — or edit the YAML directly. See [Dots inside key names](../reference/cli-commands.md#dots-inside-key-names).
 :::
@@ -2653,11 +2672,13 @@ discord:
   require_mention: true          # Require @mention to respond in server channels
   free_response_channels: ""     # Comma-separated channel IDs where bot responds without @mention
   auto_thread: true              # Auto-create threads on @mention in channels
+  free_response_auto_thread: false  # Free-response channels also auto-thread (default: reply inline)
 ```
 
 - `require_mention` — when `true` (default), the bot only responds in server channels when mentioned with `@BotName`. DMs always work without mention.
 - `free_response_channels` — comma-separated list of channel IDs where the bot responds to every message without requiring a mention.
 - `auto_thread` — when `true` (default), mentions in channels automatically create a thread for the conversation, keeping channels clean (similar to Slack threading).
+- `free_response_auto_thread` — when `true`, channels in `free_response_channels` also auto-create a thread per top-level message. Default `false`: free-response channels reply inline. Requires `auto_thread: true`.
 
 ## Security
 
@@ -2795,6 +2816,7 @@ delegation:
   worktree_isolation: false                 # Give each child its own git worktree branched from HEAD (local backend + git repos only; inspired by Muse Code). See Subagent Delegation → Worktree Isolation.
   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
+  oneshot_max_children: 2                   # Total subagents a one-shot run (hermes chat -q / --oneshot) may spawn; 0 = unlimited. Interactive and gateway sessions are never capped by this.
 ```
 
 **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
@@ -2820,6 +2842,8 @@ delegation:
 The delegation provider uses the same credential resolution as CLI/gateway startup. All configured providers are supported: `openrouter`, `nous`, `copilot`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`. When a provider is set, the system automatically resolves the correct base URL, API key, and API mode — no manual credential wiring needed.
 
 **Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
+
+**One-shot runs:** a finite `hermes chat -q` / `--oneshot` session has no later turn to consume delegated results and no later session to learn for, so it runs a smaller footprint: `skill_manage` is not offered (skills are still listed and loadable with `skill_view`), the skills prompt asks for domain skills only rather than process skills, and `oneshot_max_children` caps the total subagents the run may spawn (default `2`, `0` = unlimited). Past the cap `delegate_task` returns a tool error telling the agent to finish inline.
 
 **Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
 

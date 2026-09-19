@@ -313,7 +313,8 @@ def _responses_tools(tools: Optional[List[Dict[str, Any]]] = None) -> Optional[L
     fns = [item.get("function", {}) if isinstance(item, dict) else {} for item in tools or []]
     converted = [
         {
-            "type": "function", "name": fn["name"], "description": fn.get("description", ""), "strict": False,
+            "type": "function", "name": fn["name"], "description": fn.get("description", ""),
+            "strict": fn.get("strict") if isinstance(fn.get("strict"), bool) else False,
             "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
         }
         for fn in fns if _nonblank(fn.get("name"))
@@ -401,8 +402,19 @@ def _replay_reasoning_items(
 def _replay_message_items(
     msg: Dict[str, Any], *, is_github_responses: bool, current_issuer_kind: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Replay exact assistant message items (id/phase) for prefix-cache hits."""
+    """Replay exact assistant message items (id/phase) for prefix-cache hits.
+
+    A ``msg_*`` id minted in the same response as a ``reasoning`` item is bound to that item's ``rs_*`` id,
+    which ``_replay_reasoning_items`` always strips (store=False). Replaying the message id alone is a
+    deterministic HTTP 400 ("provided without its required 'reasoning' item", #97427/#97442), so the message
+    id is dropped whenever its turn carried encrypted reasoning — replayed, suppressed, foreign-issuer or
+    trimmed by the transport (``codex_reasoning_trimmed``) — and the message goes out as content/status/phase
+    only. Reasoning-free turns keep their id.
+    """
     replayed: List[Dict[str, Any]] = []
+    linked_to_reasoning = bool(msg.get("codex_reasoning_trimmed")) or any(
+        isinstance(ri, dict) and ri.get("encrypted_content") for ri in _as_list(msg.get("codex_reasoning_items"))
+    )
     for raw_item in _as_list(msg.get("codex_message_items")):
         if not (isinstance(raw_item, dict) and raw_item.get("type") == "message" and raw_item.get("role") == "assistant"):
             continue
@@ -412,6 +424,8 @@ def _replay_message_items(
             if isinstance(part, dict) and str(part.get("type") or "").strip() in _OUTPUT_TEXT_TYPES
         ]
         if content:
+            if linked_to_reasoning and raw_item.get("id"):
+                raw_item = {k: v for k, v in raw_item.items() if k != "id"}
             replayed.append(_assistant_message_item(
                 raw_item, content, is_github_responses=is_github_responses, current_issuer_kind=current_issuer_kind,
             ))
@@ -540,6 +554,11 @@ def _chat_messages_to_responses_input(
     item_sources: List[Optional[Dict[str, Any]]] = []
     seen_item_ids: set = set()
     wire_ids = _WireCallIds()
+    # The ChatGPT Codex backend rejects a role message whose ``content`` is a plain string with
+    # ``{"detail": "Unsupported content type"}`` (400) — even a single user turn with no replay state
+    # (#51512). It accepts only typed parts, so string text goes out as ``input_text``/``output_text``
+    # there; other Responses routes keep the string shorthand they have always received.
+    typed_text_only = current_issuer_kind == "codex_backend"
     def emit(new_items: List[Dict[str, Any]], msg: Dict[str, Any]) -> None:
         items.extend(new_items)
         item_sources.extend([msg] * len(new_items))
@@ -559,8 +578,10 @@ def _chat_messages_to_responses_input(
             "".join(p["text"] for p in content_parts if p["type"] == text_type)
             if isinstance(content, list) else _str_or_empty(content)
         )
+        def wire_content(value: Any) -> Any:
+            return [{"type": text_type, "text": value}] if typed_text_only and isinstance(value, str) else value
         if role == "user":
-            emit([{"role": role, "content": content_parts or content_text}], msg)
+            emit([{"role": role, "content": wire_content(content_parts or content_text)}], msg)
             continue
         reasoning_items = [] if not replay_encrypted_reasoning else _replay_reasoning_items(
             msg, seen_item_ids=seen_item_ids, current_issuer_kind=current_issuer_kind,
@@ -581,7 +602,7 @@ def _chat_messages_to_responses_input(
         # non-empty: strict Responses-compatible providers reject "" with 400.
         if fallback is not None and not (fallback == "" and tool_items):
             follower = " " if fallback == "" else fallback
-            emit([{"role": "assistant", "content": follower}], msg)
+            emit([{"role": "assistant", "content": wire_content(follower)}], msg)
         emit(tool_items, msg)
     # The server renders nothing placed before a compaction item, so pre-checkpoint history is
     # dead weight and plaintext asks / merged summaries silently vanish. Keep the newest checkpoint

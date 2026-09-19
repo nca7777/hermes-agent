@@ -3320,13 +3320,19 @@ class GatewayTurnMixin:
                     if matcher(final_text) is False:
                         return False
             return True
-        if previewed:
-            has_delivered_text = getattr(consumer, "has_delivered_text", None)
-            if callable(has_delivered_text):
-                try:
-                    return bool(has_delivered_text(final_text))
-                except Exception:
-                    return False
+        # Exact-text match against what the consumer DURABLY delivered (commentary, segments, and the
+        # visible prefix only once a real send landed) — safe without the ``previewed`` flag. The codex
+        # app-server bridge delivers the final agentMessage through the commentary path and never sets
+        # response_previewed (#74248 / #80519); gating on the flag re-sent every such reply. Mismatching
+        # commentary still returns False, so a distinct final answer is never suppressed (#65919). Draft
+        # frames are ephemeral and must not count: after draft streaming + a failed finalize send this
+        # predicate must stay False so the fallback final send still fires (#51828 / #33793).
+        has_delivered_text = getattr(consumer, "has_durably_delivered_text", None)
+        if callable(has_delivered_text):
+            try:
+                return bool(has_delivered_text(final_text))
+            except Exception:
+                return False
         return False
 
     def _run_agent_start_turn_worker(self, turn_ctx: TurnContext, run_sync: Callable[[], Any]) -> "GatewayRunner._RunAgentWorker":
