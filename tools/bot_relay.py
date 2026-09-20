@@ -40,6 +40,13 @@ LOCKS_DIR = "locks"
 
 # Config fallbacks (real knobs: ``bot_mode.turn_wait_seconds`` / ``bot_mode.envelope_ttl_seconds``).
 TURN_WAIT_SECONDS_FALLBACK = 120
+# Ceiling for a queued delivery's hold-and-retry wait. A saturated-but-alive bot is
+# exactly the recipient you cannot afford to skip: its own turn may legitimately run
+# for minutes (mem0/idrive/coolify workers page through long transcripts), so a single
+# bounded wait that gives up and drops the plaintext loses deadline-critical handoffs.
+# The wait re-probes while the holder is alive up to this ceiling, then raises the
+# structured 'target_busy' refusal (config knob: ``bot_mode.turn_hold_seconds``).
+TURN_HOLD_SECONDS_FALLBACK = 600
 DEFAULT_ENVELOPE_TTL_SECONDS = 900  # older envelopes are refused at drain with 'queued_expired'
 # Per-attempt turn timeout and attempt ceiling for bot_relay.deliver (tui_gateway/methods_bot_relay.py).
 TURN_ATTEMPT_TIMEOUT_SECONDS = 600
@@ -629,6 +636,18 @@ def turn_wait_seconds() -> float:
     """Wait budget for a queued delivery turn (config, lazily read)."""
     val = _bot_mode_cfg("turn_wait_seconds", loader="load_config")
     return float(TURN_WAIT_SECONDS_FALLBACK) if val is None else max(0.0, float(val))
+
+
+def turn_hold_seconds() -> float:
+    """Hold-and-retry ceiling for a queued delivery turn (``bot_mode.turn_hold_seconds``).
+
+    A single (re-)probe of the per-profile flock waits up to this ceiling before raising
+    ``TurnBusyError``. It may exceed ``turn_wait_seconds``: a saturated-but-alive bot's own
+    turn runs for minutes, and dropping the plaintext on a short give-up loses deadline-bound
+    handoffs, so the default is to hold rather than abandon (t_82fe4210).
+    """
+    val = _bot_mode_cfg("turn_hold_seconds", loader="load_config")
+    return float(TURN_HOLD_SECONDS_FALLBACK) if val is None else max(0.0, float(val))
 
 
 def turn_lock_path(root: Path | str, profile: str) -> Path:
