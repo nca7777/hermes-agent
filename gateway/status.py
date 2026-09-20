@@ -450,11 +450,22 @@ def get_process_start_time(pid: int) -> Optional[int]:
 
 
 def _read_process_cmdline(pid: int) -> Optional[str]:
-    """Process command line as one string: /proc, then ``ps``, then psutil (Windows)."""
+    """Process command line as one string: /proc, then psutil, then ``ps``.
+
+    Order is by cost, and this runs per live gateway on every roster/status poll. ``psutil`` reads
+    the process table in-process (a ``sysctl`` on macOS) where ``ps`` costs a fork+exec — measured
+    0.02ms against 4.2ms on macOS for the same string. It cannot always answer: on macOS it raises
+    ``AccessDenied`` for a process owned by another user, which ``ps`` still reports, so ``ps``
+    stays as the fallback rather than being replaced."""
     with contextlib.suppress(OSError):
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         if raw:
             return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+    with contextlib.suppress(Exception):
+        import psutil  # type: ignore
+        cmdline_parts = psutil.Process(pid).cmdline()
+        if cmdline_parts:
+            return " ".join(cmdline_parts)
     if not _IS_WINDOWS:
         with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             result = subprocess.run(
@@ -463,11 +474,6 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
-    with contextlib.suppress(Exception):
-        import psutil  # type: ignore
-        cmdline_parts = psutil.Process(pid).cmdline()
-        if cmdline_parts:
-            return " ".join(cmdline_parts)
     return None
 
 
@@ -773,6 +779,10 @@ def _pid_exists(pid: int) -> bool:
     try:
         import psutil  # type: ignore
         # Best-effort zombie check: status-read failures fall through to pid_exists().
+        # Windows has no POSIX zombies, and this probe costs ~7 ms per call — once per
+        # registry entry inside the session file lock (#115578). Skip it on Windows and
+        # let pid_exists() below (or the ctypes fallback) decide.
+        probe_zombie = os.name != "nt"
         try:
             # A zombie (defunct) process is still in the process table, so ``psutil.pid_exists()`` returns
             # True for it — but it is already dead: SIGKILL has no effect and it cannot be a running
@@ -782,7 +792,7 @@ def _pid_exists(pid: int) -> bool:
             # #42126). Report zombies as dead so the takeover proceeds. Best-effort: any failure to read
             # status (partial/stub psutil, access denied, transient race) falls through to the authoritative
             # ``pid_exists()`` below rather than raising.
-            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+            if probe_zombie and psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
                 return False
         except getattr(psutil, "NoSuchProcess", ()):
             return False
