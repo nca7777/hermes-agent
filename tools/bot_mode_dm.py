@@ -398,9 +398,17 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
     if stdin_file or len(argv) < 3 or cli not in ("hermes", "hermes.exe") or argv[1] != "-p":
         return contextlib.nullcontext()
     from tools.bot_mode_probe import _hermes_root
-    from tools.bot_relay import acquire_turn_lock
+    from tools.bot_relay import acquire_turn_lock, turn_hold_seconds
 
-    return acquire_turn_lock(_hermes_root(Path(_default_home())), argv[2])
+    # Hold-and-retry ceiling for local fleet DM turns (t_82fe4210): a saturated-but-alive
+    # teammate's own turn legitimately runs for minutes (mem0/idrive/coolify workers page long
+    # transcripts). Bounded to ``bot_mode.turn_hold_seconds`` (default 600 s) so the message is
+    # actually delivered once the holder finishes instead of being dropped after a short give-up;
+    # a wedged holder still raises the structured 'target_busy' refusal at the ceiling. The
+    # Desktop relay path keeps its own shorter ``acquire_turn_lock`` default (turn_wait_seconds)
+    # and its documented worst-case budgets in methods_bot_relay.py are unchanged.
+    return acquire_turn_lock(_hermes_root(Path(_default_home())), argv[2],
+                             timeout_seconds=turn_hold_seconds())
 
 
 def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None) -> int:

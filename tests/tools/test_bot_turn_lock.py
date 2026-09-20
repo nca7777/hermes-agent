@@ -143,6 +143,22 @@ def test_turn_wait_seconds_reads_config(monkeypatch):
     assert bot_relay.turn_wait_seconds() == 7.0
 
 
+def test_turn_hold_seconds_falls_back_to_module_constant(monkeypatch):
+    def _boom():
+        raise RuntimeError("no config")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", _boom)
+    assert bot_relay.turn_hold_seconds() == float(bot_relay.TURN_HOLD_SECONDS_FALLBACK)
+
+
+def test_turn_hold_seconds_reads_config(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"bot_mode": {"turn_hold_seconds": 300}},
+    )
+    assert bot_relay.turn_hold_seconds() == 300.0
+
+
 # ── wiring: local teammate delivery (tools/bot_mode_dm.py) ──────────────────
 
 
@@ -181,10 +197,13 @@ def test_run_delivery_holds_profile_lock_during_turn(root, tmp_path, monkeypatch
 
 
 def test_delivery_main_reports_target_busy_json(root, tmp_path, monkeypatch, capsys):
-    """A queued delivery that exceeds its budget surfaces the structured error."""
+    """A queued delivery that exceeds the holder's liveness budget surfaces the structured error."""
     home = root / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Patched so the test runs in ms not minutes: both the hold ceiling (what the DM runner
+    # passes to acquire_turn_lock) and the lock default must be short.
+    monkeypatch.setattr(bot_relay, "turn_hold_seconds", lambda: 0.2)
     monkeypatch.setattr(bot_relay, "turn_wait_seconds", lambda: 0.2)
     dm = tmp_path / "dm.txt"
     dm.write_text("hi", encoding="utf-8")
@@ -208,6 +227,51 @@ def test_delivery_main_reports_target_busy_json(root, tmp_path, monkeypatch, cap
         release.set()
         t.join(timeout=5)
     assert not dm.exists(), "DM plaintext must be reclaimed even on refusal"
+
+
+def test_delivery_holds_and_succeeds_when_holder_releases(root, tmp_path, monkeypatch):
+    """A busy-but-alive teammate is held for beyond the old 120s window: if the holder
+    releases within the hold ceiling, the queued delivery lands instead of being dropped
+    (t_82fe4210 — fleet DM handoffs were being lost to target_busy)."""
+    home = root / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # Hold ceiling comfortably exceeds the old window so the test exercises the succeed-on-release
+    # outcome; the holder releases after ~0.3s, well inside it.
+    monkeypatch.setattr(bot_relay, "turn_hold_seconds", lambda: 5.0)
+    dm = tmp_path / "dm.txt"
+    dm.write_text("hi", encoding="utf-8")
+
+    held = threading.Event()
+    release = threading.Event()
+    t = threading.Thread(
+        target=_hold_flock, args=(turn_lock_path(home, "ops"), held, release)
+    )
+    t.start()
+    assert held.wait(timeout=5)
+    threading.Timer(0.3, release.set).start()
+
+    ran = []
+
+    def _fake_run(argv, **kwargs):
+        ran.append(argv)
+
+        class _P:
+            returncode = 0
+            stdout = "delivered"
+            stderr = ""
+
+        return _P()
+
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", _fake_run)
+    start = time.monotonic()
+    rc = bot_mode_dm._run_delivery(
+        ["hermes", "-p", "ops", "chat"], str(dm), stdin_file=False
+    )
+    t.join(timeout=5)
+    assert rc == 0, "must deliver once the holder releases within the hold ceiling"
+    assert time.monotonic() - start >= 0.2, "should have held behind the busy holder"
+    assert ran, "turn must have run after acquiring the lock"
 
 
 def test_peer_stdin_delivery_skips_local_lock(root, tmp_path, monkeypatch):
