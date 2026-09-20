@@ -6030,7 +6030,13 @@ def _wizard_platform_loop() -> None:
 
 
 def _wizard_install_service(backend: str) -> None:
-    """Fresh install from the wizard: ask start-now / start-on-login, install, then start."""
+    """Fresh install from the wizard: ask start-now / start-on-login once, install, then start.
+
+    The Windows installer owns its start decision (Scheduled Task and Startup-folder
+    paths start the gateway themselves when start_now is true, and a UAC hand-off
+    installs and starts in the elevated child), so the wizard forwards the answers
+    and returns without a second start. Each install-intent question is asked exactly
+    once per setup run."""
     wsl_note = " (note: services may not survive WSL restarts)" if is_wsl() else ""
     start_now = prompt_yes_no("  Start the gateway now?", True)
     start_on_login = prompt_yes_no(
@@ -6054,7 +6060,8 @@ def _wizard_install_service(backend: str) -> None:
         elif backend == "launchd":
             launchd_install(force=False)
         else:
-            _gw_windows().install(force=False)
+            _gw_windows().install(force=False, start_now=start_now, start_on_login=start_on_login)
+            return
         print()
         if did_install and start_now:
             _setup_service_action("start", failed_label="Start failed", system=installed_scope == "system")

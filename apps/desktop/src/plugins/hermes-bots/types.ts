@@ -276,6 +276,7 @@ export interface GroupActivityEvent {
   kind: GroupActivityKind
   member?: string
   preview?: string
+  reason?: string
 }
 
 /**
