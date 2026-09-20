@@ -742,6 +742,9 @@ def _run_bot_chat_turn(argv: list, env: dict, report_path: str, timeout: float) 
     """
     from hermes_cli.quiet_single_query import read_turn_report
 
+    # The scheduler may sit in a directory that no longer exists (a kanban worker whose
+    # scratch workspace was reaped): a child inheriting that cwd dies at CLI startup
+    # (#102941). The target home is the one directory this lane has already verified.
     # Lossy decode everywhere; on Windows also decode as the UTF-8 the child writes.
     # A stray non-UTF-8 byte (e.g. a grandchild sharing the pipe interleaving a
     # partial multi-byte write) must not raise UnicodeDecodeError in the drain
@@ -760,7 +763,7 @@ def _run_bot_chat_turn(argv: list, env: dict, report_path: str, timeout: float) 
         popen_kwargs["encoding"] = "utf-8"
     proc = subprocess.Popen(
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        env=env, creationflags=windows_hide_flags(), **popen_kwargs)
+        env=env, cwd=env.get("HERMES_HOME") or None, creationflags=windows_hide_flags(), **popen_kwargs)
     streams: dict = {}
 
     def _drain() -> None:

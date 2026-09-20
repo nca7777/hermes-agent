@@ -80,6 +80,30 @@ describe('log window', () => {
     expect(trimmed.watermarks.research).toBe(150 - 104)
     expect(trimmed.watermarks.builder).toBe(0)
   })
+
+  // The whole room map is persisted to localStorage on every write; a room
+  // of long bodies must stay a small fraction of the origin quota or the
+  // swallowed setItem failure silently loses every later room write.
+  it('persists a 400-long-body room under the character budget, watermarks intact', async () => {
+    const { chat, gateway } = await loadRoom()
+    const body = 'x'.repeat(64_000)
+
+    for (let i = 0; i < chat.GROUP_CHAT_LOG_RETAIN; i++) {
+      chat.appendGroupChatEntry('Core', { kind: 'user', name: 'You' }, `${i} ${body}`, 't1')
+    }
+
+    chat.updateGroupChat('Core', room => ({ ...room, watermarks: { builder: room.log.length } }), { sync: false })
+
+    const stored = (gateway.storage.get('group-chats') as Record<string, GroupChat>).Core
+    const chars = stored.log.reduce((sum, entry) => sum + entry.text.length, 0)
+
+    expect(chars).toBeLessThanOrEqual(chat.GROUP_CHAT_LOG_RETAIN_CHARS)
+    expect(JSON.stringify(stored).length).toBeLessThan(chat.GROUP_CHAT_LOG_RETAIN_CHARS * 1.25)
+    expect(Math.max(...stored.log.map(entry => entry.text.length))).toBeLessThanOrEqual(chat.GROUP_CHAT_HISTORY_LINE_CHARS)
+    expect(stored.log.at(-1)?.text.startsWith(`${chat.GROUP_CHAT_LOG_RETAIN - 1} `)).toBe(true)
+    expect(stored.log.at(-1)?.text.endsWith('… [truncated]')).toBe(true)
+    expect(stored.watermarks.builder).toBe(stored.log.length)
+  })
 })
 
 describe('room naming', () => {
