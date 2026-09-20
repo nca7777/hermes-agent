@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import socket
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +17,86 @@ import pytest
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
+from hermes_cli.proxy.adapters.openai_codex import OpenAICodexAdapter
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+
+def _codex_jwt(account_id: str, marker: str) -> str:
+    payload = {
+        "exp": 4_102_444_800,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+            "chatgpt_data_residency": "us",
+        },
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+    return f"e30.{encoded}.{marker}"
+
+
+def _write_codex_auth_store(home: Path, access_token: str, refresh_token: str) -> bytes:
+    payload = {
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                },
+            },
+        },
+        "credential_pool": {
+            "openai-codex": [{
+                "id": f"codex-{refresh_token}",
+                "label": "Codex",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            }],
+        },
+    }
+    raw = json.dumps(payload, indent=2).encode()
+    (home / "auth.json").write_bytes(raw)
+    return raw
+
+
+def test_codex_adapter_always_resolves_default_home_pool(tmp_path, monkeypatch):
+    """A→B→A profile scopes share the root proxy without reading or copying their tokens."""
+    root = tmp_path / "default-home"
+    profile_a = root / "profiles" / "a"
+    profile_b = root / "profiles" / "b"
+    for home in (root, profile_a, profile_b):
+        home.mkdir(parents=True)
+    root_access = _codex_jwt("acct-root", "root")
+    _write_codex_auth_store(root, root_access, "root-refresh")
+    profile_a_before = _write_codex_auth_store(
+        profile_a, _codex_jwt("acct-a", "a"), "profile-a-refresh"
+    )
+    profile_b_before = _write_codex_auth_store(
+        profile_b, _codex_jwt("acct-b", "b"), "profile-b-refresh"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_a))
+
+    assert ADAPTERS["openai-codex"] is OpenAICodexAdapter
+    adapter = get_adapter("openai-codex")
+    observed = []
+    for home in (profile_a, profile_b, profile_a):
+        token = set_hermes_home_override(home)
+        try:
+            credential = adapter.get_credential()
+            observed.append(credential.bearer)
+            headers = adapter.get_upstream_headers(credential)
+            assert headers["ChatGPT-Account-ID"] == "acct-root"
+            assert headers["originator"] == "hermes-agent"
+        finally:
+            reset_hermes_home_override(token)
+
+    assert observed == [root_access, root_access, root_access]
+    assert (profile_a / "auth.json").read_bytes() == profile_a_before
+    assert (profile_b / "auth.json").read_bytes() == profile_b_before
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +312,14 @@ def test_xai_adapter_retry_rotates_pool_entry_on_429(tmp_path, monkeypatch):
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web  # noqa: E402
 
-from hermes_cli.proxy.server import create_app  # noqa: E402
+from hermes_cli.proxy.server import (  # noqa: E402
+    MAX_REQUEST_BYTES,
+    MIN_DOWNSTREAM_BEARER_LENGTH,
+    create_app,
+    is_loopback_bind_host,
+    run_server,
+    validate_bind_security,
+)
 
 
 class FakeAdapter(UpstreamAdapter):
@@ -279,6 +368,22 @@ class FakeAdapter(UpstreamAdapter):
         )
 
 
+class FakeCodexAdapter(FakeAdapter):
+    @property
+    def replaced_request_headers(self):
+        return frozenset({
+            "user-agent",
+            "originator",
+            "chatgpt-account-id",
+            "x-openai-internal-codex-residency",
+        })
+
+    def get_upstream_headers(self, credential):
+        from agent.codex_headers import codex_cloudflare_headers
+
+        return codex_cloudflare_headers(credential.bearer)
+
+
 async def _start_runner(app: "web.Application"):
     """Spin up an aiohttp app on an ephemeral localhost port. Returns (runner, base_url)."""
     runner = web.AppRunner(app, access_log=None)
@@ -296,6 +401,7 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
         captured["requests"].append({
             "method": request.method,
             "path": request.path,
+            "query": request.query_string,
             "auth": request.headers.get("Authorization"),
             "body": body.decode("utf-8") if body else "",
         })
@@ -314,6 +420,7 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
     app = web.Application()
     app.router.add_route("*", "/v1/chat/completions", echo)
     app.router.add_route("*", "/v1/embeddings", echo)
+    app.router.add_route("*", "/v1/models", echo)
     app.router.add_route("*", "/v1/sse", sse)
     return app
 
@@ -337,6 +444,71 @@ def _build_retrying_fake_upstream(captured: Dict[str, Any]) -> "web.Application"
     return app
 
 
+@pytest.mark.parametrize(
+    "host",
+    ["127.0.0.1", "127.42.0.9", "::1", "[::1]", "::ffff:127.0.0.1"],
+)
+def test_loopback_bind_classifier_accepts_ipv4_and_ipv6_literals(host):
+    assert is_loopback_bind_host(host)
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["0.0.0.0", "192.168.1.10", "::", "2001:db8::1", "::ffff:192.168.1.10"],
+)
+def test_loopback_bind_classifier_rejects_non_loopback_literals(host):
+    assert not is_loopback_bind_host(host)
+
+
+def test_loopback_bind_classifier_resolves_hostnames_fail_closed(monkeypatch):
+    answers = {
+        "localhost.test": ["127.0.0.1", "::1"],
+        "remote.test": ["203.0.113.8"],
+        "mixed.test": ["127.0.0.1", "203.0.113.8"],
+    }
+
+    def fake_getaddrinfo(host, _port, *, type):
+        assert type == socket.SOCK_STREAM
+        if host == "missing.test":
+            raise socket.gaierror("not found")
+        return [
+            (
+                socket.AF_INET6 if ":" in address else socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (address, 0),
+            )
+            for address in answers[host]
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    assert is_loopback_bind_host("localhost.test")
+    assert validate_bind_security("localhost.test", None) == "127.0.0.1"
+    assert not is_loopback_bind_host("remote.test")
+    assert not is_loopback_bind_host("mixed.test")
+    assert not is_loopback_bind_host("missing.test")
+
+
+def test_non_loopback_bind_requires_strong_downstream_bearer():
+    with pytest.raises(ValueError, match="Refusing non-loopback"):
+        validate_bind_security("0.0.0.0", None)
+    with pytest.raises(ValueError, match="at least 32 non-whitespace"):
+        validate_bind_security("0.0.0.0", "short")
+    with pytest.raises(ValueError, match="at least 32 non-whitespace"):
+        validate_bind_security("0.0.0.0", "x" * MIN_DOWNSTREAM_BEARER_LENGTH + " ")
+
+    validate_bind_security("0.0.0.0", "x" * MIN_DOWNSTREAM_BEARER_LENGTH)
+    validate_bind_security("127.0.0.1", None)
+
+
+def test_server_boundary_refuses_unsafe_remote_bind():
+    adapter = FakeAdapter("http://127.0.0.1:1/v1")
+    with pytest.raises(ValueError, match="Refusing non-loopback"):
+        asyncio.run(run_server(adapter, host="::", downstream_bearer=None))
+
+
 
 
 
@@ -358,6 +530,230 @@ def test_server_strips_client_auth_header():
                     await resp.read()
             assert captured["requests"][0]["auth"] == "Bearer ours"
             assert "SHOULD_NOT_LEAK" not in captured["requests"][0]["auth"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_downstream_bearer_auth_gates_forwarding_and_keeps_health_open(caplog):
+    """Missing/wrong bearers never resolve credentials; the exact bearer forwards once."""
+    downstream_secret = "container-only-secret"
+    caplog.set_level("DEBUG", logger="hermes_cli.proxy.server")
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="upstream-secret")
+        proxy_runner, proxy_base = await _start_runner(
+            create_app(adapter, downstream_bearer=downstream_secret)
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{proxy_base}/health") as response:
+                    assert response.status == 200
+                    assert (await response.json())["status"] == "ok"
+
+                for headers in (
+                    {},
+                    {"Authorization": "Bearer wrong-secret"},
+                    {"Authorization": f"Basic {downstream_secret}"},
+                    {"Authorization": f"Bearer{downstream_secret}"},
+                    {"Authorization": f"Bearer  {downstream_secret}"},
+                    {"Authorization": f"Bearer\t{downstream_secret}"},
+                ):
+                    async with session.post(
+                        f"{proxy_base}/v1/chat/completions",
+                        json={"must_not_forward": True},
+                        headers=headers,
+                    ) as response:
+                        body = await response.json()
+                        assert response.status == 401
+                        assert response.headers["WWW-Authenticate"] == "Bearer"
+                        assert body["error"]["code"] == "invalid_downstream_auth"
+
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"forward": True},
+                    headers={"Authorization": f"Bearer {downstream_secret}"},
+                ) as response:
+                    assert response.status == 200
+                    assert await response.json() == {
+                        "echoed": True,
+                        "path": "/v1/chat/completions",
+                    }
+
+            assert adapter.calls == 1
+            assert len(captured["requests"]) == 1
+            assert captured["requests"][0]["auth"] == "Bearer upstream-secret"
+            assert json.loads(captured["requests"][0]["body"]) == {"forward": True}
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+    assert downstream_secret not in caplog.text
+
+
+def test_path_methods_are_enforced_before_credential_resolution():
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            allowed=["/responses", "/models"],
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                for method, path, allow in (
+                    ("GET", "/responses", "POST"),
+                    ("POST", "/models", "GET, HEAD"),
+                    ("DELETE", "/models", "GET, HEAD"),
+                ):
+                    async with session.request(method, f"{proxy_base}/v1{path}") as response:
+                        assert response.status == 405
+                        assert response.headers["Allow"] == allow
+                        assert (await response.json())["error"]["code"] == "method_not_allowed"
+                assert adapter.calls == 0
+                assert captured["requests"] == []
+
+                for method in ("GET", "HEAD"):
+                    async with session.request(method, f"{proxy_base}/v1/models") as response:
+                        assert response.status == 200
+                        await response.read()
+                assert adapter.calls == 2
+                assert [request["method"] for request in captured["requests"]] == ["GET", "HEAD"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_oversized_body_is_rejected_before_credential_resolution():
+    async def run():
+        adapter = FakeAdapter("http://127.0.0.1:1/v1")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    data=b"x" * (MAX_REQUEST_BYTES + 1),
+                ) as response:
+                    assert response.status == 413
+                    await response.read()
+            assert adapter.calls == 0
+        finally:
+            await proxy_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_debug_log_omits_forwarded_query_string(caplog):
+    query_secret = "must-not-appear-in-logs"
+    caplog.set_level("DEBUG", logger="hermes_cli.proxy.server")
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions?api_key={query_secret}",
+                    json={},
+                ) as response:
+                    assert response.status == 200
+                    await response.read()
+            assert captured["requests"][0]["query"] == f"api_key={query_secret}"
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+    assert query_secret not in caplog.text
+    assert "?" not in next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "hermes_cli.proxy.server" and "forwarding" in record.getMessage()
+    )
+
+
+def test_codex_responses_tools_and_stream_pass_through_with_server_identity():
+    async def run():
+        captured: Dict[str, Any] = {}
+        frames = [
+            b'data: {"type":"response.output_item.done","item":{"type":"function_call",'
+            b'"call_id":"call_1","name":"lookup","arguments":"{\\"q\\":\\"test\\"}"}}\n\n',
+            b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+
+        async def responses(request):
+            captured["body"] = await request.json()
+            captured["headers"] = dict(request.headers)
+            response = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "text/event-stream"},
+            )
+            await response.prepare(request)
+            for frame in frames:
+                await response.write(frame)
+            await response.write_eof()
+            return response
+
+        upstream = web.Application()
+        upstream.router.add_post("/v1/responses", responses)
+        upstream_runner, upstream_base = await _start_runner(upstream)
+        root_token = _codex_jwt("acct-proxy-root", "proxy")
+        adapter = FakeCodexAdapter(
+            f"{upstream_base}/v1",
+            bearer=root_token,
+            allowed=["/responses"],
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        payload = {
+            "model": "gpt-test",
+            "stream": True,
+            "input": [{"role": "user", "content": "use the tool"}],
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Lookup a value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+            }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses",
+                    json=payload,
+                    headers={
+                        "Authorization": "Bearer CLIENT-MUST-NOT-LEAK",
+                        "User-Agent": "spoofed-client",
+                        "originator": "spoofed-origin",
+                        "ChatGPT-Account-ID": "acct-spoofed",
+                        "x-openai-internal-codex-residency": "spoofed-region",
+                    },
+                ) as response:
+                    body = await response.read()
+
+            assert captured["body"] == payload
+            assert captured["headers"]["Authorization"] == f"Bearer {root_token}"
+            assert captured["headers"]["ChatGPT-Account-ID"] == "acct-proxy-root"
+            assert captured["headers"]["originator"] == "hermes-agent"
+            assert captured["headers"]["User-Agent"].startswith("HermesAgent/")
+            assert captured["headers"]["x-openai-internal-codex-residency"] == "us"
+            assert body == b"".join(frames)
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
@@ -503,6 +899,63 @@ def test_proxy_does_not_append_done_after_malformed_trailing_frame():
 # ---------------------------------------------------------------------------
 
 
+def test_cli_refuses_unsafe_remote_bind_before_credential_lookup(monkeypatch, capsys):
+    from hermes_cli.proxy import cli as proxy_cli
+
+    adapter = MagicMock()
+    monkeypatch.setattr(proxy_cli, "get_adapter", lambda _provider: adapter)
+    monkeypatch.delenv("SUBSCRIPTION_PROXY_KEY", raising=False)
+
+    result = proxy_cli.cmd_proxy_start(
+        SimpleNamespace(provider="nous", host="0.0.0.0", port=8645)
+    )
+
+    assert result == 2
+    adapter.is_authenticated.assert_not_called()
+    assert "Refusing non-loopback" in capsys.readouterr().err
+
+
+def test_cli_propagates_downstream_bearer_from_environment(monkeypatch, capsys):
+    from hermes_cli.proxy import cli as proxy_cli
+
+    downstream_bearer = "0123456789abcdef" * 2
+    adapter = MagicMock()
+    adapter.is_authenticated.return_value = True
+    adapter.display_name = "Fake Provider"
+    captured = {}
+
+    async def fake_run_server(
+        actual_adapter,
+        *,
+        host,
+        port,
+        downstream_bearer,
+    ):
+        captured.update(
+            adapter=actual_adapter,
+            host=host,
+            port=port,
+            downstream_bearer=downstream_bearer,
+        )
+
+    monkeypatch.setattr(proxy_cli, "get_adapter", lambda _provider: adapter)
+    monkeypatch.setattr(proxy_cli, "run_server", fake_run_server)
+    monkeypatch.setenv("SUBSCRIPTION_PROXY_KEY", downstream_bearer)
+
+    result = proxy_cli.cmd_proxy_start(
+        SimpleNamespace(provider="nous", host="0.0.0.0", port=9864)
+    )
+
+    assert result == 0
+    assert captured == {
+        "adapter": adapter,
+        "host": "0.0.0.0",
+        "port": 9864,
+        "downstream_bearer": downstream_bearer,
+    }
+    output = capsys.readouterr().err
+    assert "Downstream auth: required (SUBSCRIPTION_PROXY_KEY)" in output
+    assert downstream_bearer not in output
 
 
 

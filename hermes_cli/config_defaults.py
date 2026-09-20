@@ -2990,6 +2990,11 @@ OPTIONAL_ENV_VARS = {
         "Bearer token for API server authentication. Required whenever the API server is "
         "enabled; server refuses to start without it.", "API server auth key", None, password=True,
         advanced=True),
+    "SUBSCRIPTION_PROXY_KEY": _msg(
+        "Bearer token required from clients of `hermes proxy`. Optional for loopback-only binds; "
+        "non-loopback binds require at least 32 non-whitespace characters.",
+        "Subscription proxy auth key", None,
+        password=True, advanced=True),
     "API_SERVER_PORT": _msg("Port for the API server (default: 8642).", "API server port", None,
         advanced=True),
     "API_SERVER_HOST": _msg(

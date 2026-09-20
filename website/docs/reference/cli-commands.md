@@ -625,11 +625,18 @@ Runs the `~/.codex/config.toml` migration that `/codex-runtime codex_app_server`
 hermes proxy <subcommand>
 ```
 
-Run a local OpenAI-compatible HTTP server that forwards requests to an OAuth-authenticated upstream provider (e.g. Nous Portal, xAI). External apps can point at the proxy with any bearer token; the proxy attaches your real OAuth credentials on the way out. See [Subscription Proxy](../user-guide/features/subscription-proxy.md) for the full guide.
+Run a local OpenAI-compatible HTTP server that forwards requests to an
+OAuth-authenticated upstream provider (Nous Portal, OpenAI Codex, or xAI).
+The proxy attaches your real OAuth credential on the way out. Set the
+`SUBSCRIPTION_PROXY_KEY` secret with `hermes config set` to require an exact
+downstream bearer before forwarding. Non-loopback binds are refused unless
+that key contains at least 32 non-whitespace characters. See
+[Subscription Proxy](../user-guide/features/subscription-proxy.md) for the
+full guide.
 
 | Subcommand | Description |
 |------------|-------------|
-| `start` | Run the proxy in the foreground. Flags: `--provider <nous\|xai>` (default `nous`), `--host <addr>` (default `127.0.0.1`; use `0.0.0.0` to expose on LAN), `--port <int>` (default `8645`). |
+| `start` | Run the proxy in the foreground. Flags: `--provider <nous\|openai-codex\|xai>` (default `nous`), `--host <addr>` (default `127.0.0.1`; every non-loopback bind requires a 32+ character `SUBSCRIPTION_PROXY_KEY`), `--port <int>` (default `8645`). |
 | `status` | Show which proxy upstreams are ready (credentials present, OAuth valid). |
 | `providers` | List available proxy upstream providers. |
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from typing import FrozenSet, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,12 @@ class UpstreamAdapter(ABC):
         """Paths relative to the proxy's ``/v1`` mount (``"/chat/completions"`` ⇒
         ``/v1/chat/completions``); anything else gets a 404 with a helpful body."""
 
+    def allowed_methods(self, path: str) -> FrozenSet[str]:
+        """HTTP methods accepted for an allowed path."""
+        if path == "/models":
+            return frozenset({"GET", "HEAD"})
+        return frozenset({"POST"})
+
     @abstractmethod
     def is_authenticated(self) -> bool:
         """Cheap (no network) usable-credentials check; ``proxy start`` uses it for a clear
@@ -53,6 +59,16 @@ class UpstreamAdapter(ABC):
         default is no retry."""
         _ = failed_credential, status_code
         return None
+
+    @property
+    def replaced_request_headers(self) -> FrozenSet[str]:
+        """Lowercase client header names this adapter replaces instead of forwarding."""
+        return frozenset()
+
+    def get_upstream_headers(self, credential: UpstreamCredential) -> Mapping[str, str]:
+        """Provider-required headers added after client headers are filtered."""
+        _ = credential
+        return {}
 
     def describe(self) -> str:
         """One-line status summary for ``proxy status``."""

@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from typing import Any
 
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.server import (
-    AIOHTTP_AVAILABLE, DEFAULT_HOST, DEFAULT_PORT, run_server
+    AIOHTTP_AVAILABLE,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    DOWNSTREAM_BEARER_ENV,
+    run_server,
+    validate_bind_security,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,27 +36,48 @@ def cmd_proxy_start(args: Any) -> int:
     except ValueError as exc:
         _err(f"Error: {exc}")
         return 2
+    host = getattr(args, "host", None) or DEFAULT_HOST
+    port = getattr(args, "port", None) or DEFAULT_PORT
+    downstream_bearer = os.environ.get(DOWNSTREAM_BEARER_ENV) or None
+    try:
+        validate_bind_security(host, downstream_bearer)
+    except ValueError as exc:
+        _err(f"Error: {exc}")
+        return 2
     if not adapter.is_authenticated():
         auth_hint = getattr(adapter, "auth_hint", f"hermes auth add {adapter.name}")
         _err(f"Not logged into {adapter.display_name}. Run `{auth_hint}` first.")
         return 2
-    host = getattr(args, "host", None) or DEFAULT_HOST
-    port = getattr(args, "port", None) or DEFAULT_PORT
+    auth_status = (
+        f"required ({DOWNSTREAM_BEARER_ENV})"
+        if downstream_bearer
+        else f"disabled (set {DOWNSTREAM_BEARER_ENV} to require a bearer)"
+    )
     _err(
         f"Starting Hermes proxy for {adapter.display_name}\n"
         f"  Listening on:  http://{host}:{port}/v1\n"
         f"  Forwarding to: (resolved per-request from your subscription)\n"
-        f"  Use any bearer token in the client — the proxy attaches your real credential.\n"
+        f"  Downstream auth: {auth_status}\n"
         f"\n"
         f"Press Ctrl+C to stop."
     )
     try:
-        asyncio.run(run_server(adapter, host=host, port=port))
+        asyncio.run(
+            run_server(
+                adapter,
+                host=host,
+                port=port,
+                downstream_bearer=downstream_bearer,
+            )
+        )
     except KeyboardInterrupt:
         _err("\nproxy: stopped")
     except OSError as exc:
         _err(f"proxy: failed to bind {host}:{port}: {exc}")
         return 1
+    except ValueError as exc:
+        _err(f"proxy: refused to start: {exc}")
+        return 2
     return 0
 
 
@@ -95,12 +122,14 @@ def cmd_proxy(args: Any) -> int:
     handler = _SUBCOMMANDS.get(getattr(args, "proxy_command", None))
     if handler is not None:
         return handler(args)
+    providers = "|".join(sorted(ADAPTERS))
     _err(
         "hermes proxy — local OpenAI-compatible proxy that attaches your\n"
         "OAuth-authenticated provider credentials to outbound requests.\n"
+        f"{DOWNSTREAM_BEARER_ENV} is optional on loopback and required for every other bind.\n"
         "\n"
         "Subcommands:\n"
-        "  hermes proxy start [--provider nous|xai] [--host 127.0.0.1] [--port 8645]\n"
+        f"  hermes proxy start [--provider {providers}] [--host 127.0.0.1] [--port 8645]\n"
         "      Run the proxy in the foreground.\n"
         "  hermes proxy status\n"
         "      Show which upstream adapters are ready.\n"
