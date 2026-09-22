@@ -1019,7 +1019,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     ended_at            INTEGER,
     outcome             TEXT,
     -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    --          gave_up | reclaimed | oom_killed | (null while still running)
+    -- oom_killed: the worker's own scope hit its MemoryMax (kernel memcg OOM kill);
+    --             kept apart from ``crashed`` so the board can tell "this work needs
+    --             more memory than one worker gets" from "this work is broken".
     summary             TEXT,
     metadata            TEXT,
     error               TEXT

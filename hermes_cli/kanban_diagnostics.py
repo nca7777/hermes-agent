@@ -364,7 +364,10 @@ def _failure_threshold(cfg: dict) -> Any:
     return cfg.get("failure_threshold", cfg.get("spawn_failure_threshold", 3))
 
 
-_OUTCOME_LABELS = {"spawn_failed": "spawn", "timed_out": "timeout", "crashed": "crash"}
+_OUTCOME_LABELS = {
+    "spawn_failed": "spawn", "timed_out": "timeout", "crashed": "crash",
+    "oom_killed": "OOM kill",
+}
 
 
 def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
@@ -393,7 +396,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     # Most recent failure outcome makes the title/action specific.
     most_recent_outcome = next(
         (oc for oc in (_task_field(r, "outcome") for r in _runs_newest_first(runs))
-         if oc in {"spawn_failed", "timed_out", "crashed"}),
+         if oc in {"spawn_failed", "timed_out", "crashed", "oom_killed"}),
         None,
     )
 
@@ -403,7 +406,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
         doctor, auth = f"hermes -p {assignee} doctor", f"hermes -p {assignee} auth"
         actions.append(_cli_hint(f"Verify profile: {doctor}", doctor, suggested=True))
         actions.append(_cli_hint(f"Fix profile auth: {auth}", auth))
-    elif most_recent_outcome in {"timed_out", "crashed"}:
+    elif most_recent_outcome in {"timed_out", "crashed", "oom_killed"}:
         # Worker got off the ground but died: logs diagnose, reclaim/reassign recover.
         task_id = _task_field(task, "id")
         if task_id:
@@ -465,20 +468,36 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
 
     threshold = int(cfg.get("crash_threshold", 2))
-    # Count trailing consecutive 'crashed' outcomes; a success (or manual
-    # reclaim) breaks the streak, other outcomes neither count nor break it.
+    # Count trailing consecutive crash outcomes (an own-cgroup OOM kill counts: it
+    # is a crash the operator must act on); a success (or manual reclaim) breaks the
+    # streak, other outcomes neither count nor break it.
     consecutive = 0
+    oom_killed = 0
     last_err = None
+    oom_err = None
     for r in _runs_newest_first(runs):
         outcome = _task_field(r, "outcome")
-        if outcome == "crashed":
+        if outcome in {"crashed", "oom_killed"}:
             consecutive += 1
+            if outcome == "oom_killed":
+                oom_killed += 1
+                if oom_err is None:
+                    oom_err = _task_field(r, "error")
             if last_err is None:
                 last_err = _task_field(r, "error")
         elif outcome in {"completed", "reclaimed"}:
             break
     if consecutive < threshold:
         return []
+    # An OOM error text names the memory ceiling; a plain crash error is a symptom.
+    if oom_err:
+        last_err = oom_err
+    oom_note = (
+        f" {oom_killed} of them were killed by the worker's OWN cgroup MemoryMax: this work needs "
+        "more memory than one worker is allowed, so a retry re-dies identically — split the card, "
+        "or move the heavy step out of the worker scope."
+        if oom_killed else ""
+    )
     task_id = _task_field(task, "id")
     actions: list[DiagnosticAction] = []
     if task_id:
@@ -487,23 +506,26 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     severity = "critical" if consecutive >= threshold * 2 else "error"
     # Error up-front so operators see WHAT broke without opening the logs.
     err_snippet = _error_snippet(last_err)
+    label = "OOM-killed" if oom_killed else "crashed"
     if err_snippet:
-        title = f"Agent crashed {consecutive}x: {err_snippet.splitlines()[0][:160]}"
+        title = f"Agent {label} {consecutive}x: {err_snippet.splitlines()[0][:160]}"
         detail = (
-            f"The last {consecutive} runs ended with outcome=crashed. "
-            f"Full last error:\n\n{err_snippet}"
+            f"The last {consecutive} runs ended with outcome={label.lower().replace('-', '_')}. "
+            f"Full last error:\n\n{err_snippet}{oom_note}"
         )
     else:
-        title = f"Agent crashed {consecutive}x (no error recorded)"
+        title = f"Agent {label} {consecutive}x (no error recorded)"
         detail = (
-            f"The last {consecutive} runs ended with outcome=crashed but "
-            f"no error text was captured. Check the worker log for more."
+            f"The last {consecutive} runs ended with outcome={label.lower().replace('-', '_')} but "
+            f"no error text was captured. Check the worker log for more.{oom_note}"
         )
     return [Diagnostic(
         kind="repeated_crashes", severity=severity,
         title=title, detail=detail, actions=actions,
         first_seen_at=now, last_seen_at=now, count=consecutive,
-        data={"consecutive_crashes": consecutive, "last_error": last_err},
+        data={
+            "consecutive_crashes": consecutive, "oom_killed": oom_killed, "last_error": last_err,
+        },
     )]
 
 
