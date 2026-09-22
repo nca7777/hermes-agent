@@ -385,6 +385,33 @@ def _oom_kill_error_text(pid: int, evidence: Mapping[str, Any]) -> str:
     )
 
 
+def _oom_killed_dead_worker(
+    pid: int,
+    claimer: Optional[str],
+    evidence: Mapping[str, Any],
+    *,
+    exit_kind: Optional[str] = None,
+    exit_code: Optional[int] = None,
+) -> _DeadWorker:
+    """How a worker the kernel OOM-killed inside its own scope is booked.
+
+    One construction site for both detection paths (no trailer at all, and a trailer
+    too stale to trust) so the outcome, the event kind and the evidence keys cannot
+    drift apart between them. ``exit_kind``/``exit_code`` are passed only when THIS
+    run observed them; a trailer-derived code may belong to an earlier run of the
+    same card, and naming it as this death's exit code would be a fiction.
+    """
+    return _DeadWorker(
+        "oom_killed", exit_code, _oom_kill_error_text(pid, evidence), "crashed",
+        {
+            "pid": pid, "claimer": claimer, "exit_kind": exit_kind, "exit_code": exit_code,
+            "oom_killed": True, "systemd_unit": evidence["unit"],
+            "memory_peak": evidence.get("memory_peak"),
+        },
+        oom_killed=True,
+    )
+
+
 def reap_worker_zombies() -> "list[int]":
     """Reap exited workers without blocking; returns reaped PIDs. POSIX reaps
     every child via ``waitpid(-1)``; Windows polls the ``Popen`` handles
@@ -1186,6 +1213,9 @@ def _classify_dead_worker_exit(
     epilogue (killed, OOM) leaves no trailer; an own-cgroup OOM kill is then
     confirmed against the scope's journal (``read_worker_oom_kill_evidence``) and
     booked as ``oom_killed`` instead of a bare crash.
+
+    A trailer-derived classification is checked against the journal FIRST, before
+    any of it is trusted: see the comment on the probe below.
     """
     kind, code = _classify_worker_exit(pid)
     kind_from_trailer = False
@@ -1194,6 +1224,23 @@ def _classify_dead_worker_exit(
         if logged is not None:
             kind, code = _exit_code_kind(logged)
             kind_from_trailer = True
+    if task_id is not None and kind_from_trailer:
+        # A trailer is NOT per-run, so it cannot vouch for this death. The log is
+        # append-mode across re-runs (``_open_worker_log``) and
+        # ``_worker_log_exit_code`` takes the last trailer of its 4 KB tail, so a
+        # re-run that wrote little before dying is classified by a PREVIOUS run's
+        # exit code. The scope's journal cannot be stale — its unit name carries
+        # this run's id (``_worker_scope_unit``) — so ask it before trusting the
+        # trailer. Without this, an own-cgroup OOM death that left a stale ``rc=0``
+        # trailer behind is booked as that trailer's protocol violation: the durable
+        # OOM count does not move, the escalation never arms, and the operator reads
+        # "worker exited cleanly (rc=0) without kanban_complete" for a card the
+        # kernel OOM-killed. One bounded subprocess per trailer-classified death.
+        evidence = read_worker_oom_kill_evidence(task_id, run_id)
+        if evidence is not None:
+            # No exit_kind/exit_code: whatever the trailer named may belong to an
+            # earlier run, and reporting it as THIS death's code would be a fiction.
+            return _oom_killed_dead_worker(pid, claimer, evidence)
     if kind == "clean_exit":
         # rc=0 while still ``running``: usually the work succeeded and only the
         # paperwork was skipped; the corrective sentence reaches the retry
@@ -1231,21 +1278,13 @@ def _classify_dead_worker_exit(
     if task_id is not None and not kind_from_trailer:
         # Nothing the worker wrote can describe a SIGKILL, so ask the scope itself:
         # its journal entry outlives the collected transient unit (see the block
-        # comment above ``_OOM_KILL_JOURNAL_TIMEOUT_SECONDS``). Skipped when the
-        # worker's own trailer already named its exit code: that worker ran its
-        # epilogue, so an OOM kill of the scope can only have hit it afterwards.
-        # One bounded subprocess per crash-classified death.
+        # comment above ``_OOM_KILL_JOURNAL_TIMEOUT_SECONDS``). Trailers were already
+        # checked against the same journal before the ``clean_exit`` branch above, so
+        # this probe is only reached for a death with no trailer at all — one bounded
+        # subprocess per crash-classified death, never two.
         evidence = read_worker_oom_kill_evidence(task_id, run_id)
         if evidence is not None:
-            return _DeadWorker(
-                "oom_killed", code, _oom_kill_error_text(pid, evidence), "crashed",
-                {
-                    "pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code,
-                    "oom_killed": True, "systemd_unit": evidence["unit"],
-                    "memory_peak": evidence.get("memory_peak"),
-                },
-                oom_killed=True,
-            )
+            return _oom_killed_dead_worker(pid, claimer, evidence, exit_kind=kind, exit_code=code)
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":

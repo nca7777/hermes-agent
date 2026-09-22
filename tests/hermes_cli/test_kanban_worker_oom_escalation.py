@@ -22,6 +22,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 TASK_ID = "t_oom0001"
 RUN_ID = 7
@@ -239,3 +240,128 @@ def test_oom_error_text_is_not_mistaken_for_an_auth_wall(
 
         assert "auth" in (kb.get_task(conn, tid).last_failure_error or "")
         assert kbd.check_respawn_guard(conn, tid) is None
+
+
+# ---------------------------------------------------------------------------
+# A stale exit trailer must not be able to hide a real OOM kill
+# ---------------------------------------------------------------------------
+# ``_worker_log_exit_code`` reads the LAST trailer of the 4 KB tail of an
+# APPEND-MODE log shared by every run of the card, so the trailer it finds can
+# belong to a PREVIOUS run. Trusting it before asking the journal booked an
+# own-cgroup OOM death as that earlier run's clean-exit protocol violation: the
+# durable OOM count never moved and the escalation never armed.
+
+def _append_worker_log(tid: str, text: str) -> None:
+    """Append to the card's own log, the way a re-run does (``_open_worker_log``)."""
+    log = kb.worker_log_path(tid)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+_STALE_TRAILER = f"previous run: wrote its epilogue\n{KANBAN_WORKER_EXIT_TRAILER}0\n"
+_OWN_OUTPUT = "build output of the run that died\n"
+
+
+@pytest.mark.parametrize("shape", ["trailer_after_own_output", "trailer_before_own_output"])
+def test_a_stale_exit_trailer_cannot_hide_an_oom_kill(
+    kanban_home, monkeypatch: pytest.MonkeyPatch, shape: str,
+):
+    """Prior run's ``rc=0`` trailer in the same log + journal OOM evidence ⇒ the death
+    is still booked ``oom_killed``, in both append orders (the trailer last is the
+    harsher shape: nothing follows it to give it away)."""
+    monkeypatch.setattr(kbd, "read_worker_oom_kill_evidence", _oom_evidence)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="heavy re-run", assignee="a")
+        _claim_dead_worker(conn, tid, 84001)
+        _append_worker_log(
+            tid,
+            _OWN_OUTPUT + _STALE_TRAILER if shape == "trailer_after_own_output"
+            else _STALE_TRAILER + _OWN_OUTPUT,
+        )
+        assert kbd._worker_log_exit_code(tid) == 0  # the trailer IS what gets read
+
+        kbd.detect_crashed_workers(conn)
+
+        run = _latest_run(conn, tid)
+        metadata = kb._json_dict(run["metadata"])
+        assert run["outcome"] == "oom_killed"
+        assert metadata.get("oom_killed") is True
+        assert metadata.get("systemd_unit") == UNIT
+        assert metadata.get("memory_peak") == "4G"
+        assert "MemoryMax" in run["error"]
+        # The stale trailer's code is not passed off as THIS death's exit code.
+        assert metadata.get("exit_code") is None
+        assert metadata.get("exit_kind") is None
+        assert "worker exited cleanly" not in (run["error"] or "")
+        # The durable count moved, so the escalation can arm.
+        assert kbd._oom_kill_deaths(conn, tid) == 1
+
+
+def test_a_stale_trailer_without_oom_evidence_keeps_its_protocol_violation(
+    kanban_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """The other side of the same coin: the journal is consulted, and when it does NOT
+    vouch for an OOM kill the trailer keeps its ordinary booking — a genuinely sloppy
+    worker is not relabelled as memory-bound."""
+    monkeypatch.setattr(kbd, "read_worker_oom_kill_evidence", lambda *_a, **_k: None)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="sloppy", assignee="a")
+        _claim_dead_worker(conn, tid, 84501)
+        _append_worker_log(tid, _OWN_OUTPUT + _STALE_TRAILER)
+
+        kbd.detect_crashed_workers(conn)
+
+        run = _latest_run(conn, tid)
+        assert run["outcome"] == "crashed"
+        assert kb._json_dict(run["metadata"]).get("protocol_violation") is True
+        assert "worker exited cleanly" in run["error"]
+        assert kbd._oom_kill_deaths(conn, tid) == 0
+        # A protocol violation is counted by its own streak, not the crash breaker —
+        # the point here is only that the death kept its ordinary booking.
+        assert "oom_killed" not in (run["metadata"] or "")
+
+
+def test_a_stale_rate_limit_trailer_cannot_requeue_an_oom_killed_card(
+    kanban_home, monkeypatch: pytest.MonkeyPatch,
+):
+    """A stale trailer naming the quota sentinel would requeue the card WITHOUT counting
+    a failure — a silent, endless loop for a card that is really memory-bound. The
+    journal outranks it, so the death is counted like any other OOM kill."""
+    monkeypatch.setattr(kbd, "read_worker_oom_kill_evidence", _oom_evidence)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="heavy", assignee="a")
+        _claim_dead_worker(conn, tid, 84601)
+        _append_worker_log(
+            tid, _OWN_OUTPUT + f"{KANBAN_WORKER_EXIT_TRAILER}{kb.KANBAN_RATE_LIMIT_EXIT_CODE}\n",
+        )
+
+        kbd.detect_crashed_workers(conn)
+
+        run = _latest_run(conn, tid)
+        assert run["outcome"] == "oom_killed"
+        assert kb.get_task(conn, tid).consecutive_failures == 1
+
+
+def test_the_scope_journal_is_asked_once_per_death(kanban_home, monkeypatch: pytest.MonkeyPatch):
+    """One bounded ``journalctl`` per reclaimed death, whichever path classified it —
+    the trailer probe and the no-trailer probe are never both run for one death."""
+    calls: list[tuple] = []
+
+    def _counted(*args, **_kwargs):
+        calls.append(args)
+        return None
+
+    monkeypatch.setattr(kbd, "read_worker_oom_kill_evidence", _counted)
+    with kbc.connect() as conn:
+        trailer_tid = kb.create_task(conn, title="trailer death", assignee="a")
+        _claim_dead_worker(conn, trailer_tid, 85001)
+        _append_worker_log(conn and trailer_tid, _OWN_OUTPUT + _STALE_TRAILER)
+
+        silent_tid = kb.create_task(conn, title="no trailer at all", assignee="a")
+        _claim_dead_worker(conn, silent_tid, 85002)
+
+        kbd.detect_crashed_workers(conn)
+
+        assert len(calls) == 2
+        assert [args[0] for args in calls] == [trailer_tid, silent_tid]
