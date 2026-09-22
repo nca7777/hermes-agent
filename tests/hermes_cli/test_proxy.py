@@ -230,7 +230,13 @@ def test_xai_adapter_retry_rotates_pool_entry_on_429(tmp_path, monkeypatch):
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web  # noqa: E402
 
-from hermes_cli.proxy.server import create_app  # noqa: E402
+from hermes_cli.proxy.server import BEARER_ENV_VAR, create_app, required_bearer  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_proxy_bearer(monkeypatch):
+    """Enforcement is env-driven; keep the developer's own shell out of the test outcome."""
+    monkeypatch.delenv(BEARER_ENV_VAR, raising=False)
 
 
 class FakeAdapter(UpstreamAdapter):
@@ -491,6 +497,132 @@ def test_proxy_does_not_append_done_after_malformed_trailing_frame():
                 ) as resp:
                     body = await resp.read()
             assert "data: [DONE]" not in body.decode("utf-8")
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Inbound bearer enforcement (SUBSCRIPTION_PROXY_KEY)
+# ---------------------------------------------------------------------------
+
+
+def test_required_bearer_reads_env_and_defaults_off(monkeypatch):
+    """Enforcement is opt-in: the env var decides, and whitespace never counts as a key."""
+    monkeypatch.delenv(BEARER_ENV_VAR, raising=False)
+    assert required_bearer() == ""
+    monkeypatch.setenv(BEARER_ENV_VAR, "   ")
+    assert required_bearer() == ""
+    monkeypatch.setenv(BEARER_ENV_VAR, "  sekret  ")
+    assert required_bearer() == "sekret"
+
+
+def test_proxy_requires_matching_bearer_when_env_set(monkeypatch):
+    """With the env var set, only a matching inbound bearer reaches the upstream."""
+    monkeypatch.setenv(BEARER_ENV_VAR, "sekret")
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            sent = [
+                None,                            # no Authorization at all
+                "Bearer retired-value",          # a rotated-away key
+                "Bearer sekret ",                # trailing space is tolerated
+                "Bearer SEKRE",                  # prefix of the real key
+                "Basic sekret",                  # right secret, wrong scheme
+                "sekret",                        # bare value, no scheme
+            ]
+            statuses = []
+            async with aiohttp.ClientSession() as session:
+                for value in sent:
+                    headers = {} if value is None else {"Authorization": value}
+                    async with session.post(
+                        f"{proxy_base}/v1/chat/completions", json={}, headers=headers
+                    ) as resp:
+                        await resp.read()
+                        statuses.append(resp.status)
+            assert statuses == [401, 401, 200, 401, 401, 401]
+            # Exactly one call got through, and it carried OUR credential, never the caller's.
+            assert len(captured["requests"]) == 1
+            assert captured["requests"][0]["auth"] == "Bearer ours"
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_proxy_rejection_names_the_env_var_without_leaking_it(monkeypatch):
+    """The 401 body points at the env var and never echoes the expected value."""
+    monkeypatch.setenv(BEARER_ENV_VAR, "sekret")
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        proxy_runner, proxy_base = await _start_runner(create_app(FakeAdapter(f"{upstream_base}/v1")))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions", json={},
+                    headers={"Authorization": "Bearer nope"},
+                ) as resp:
+                    body = (await resp.read()).decode("utf-8")
+                    challenge = resp.headers.get("WWW-Authenticate")
+            assert BEARER_ENV_VAR in body
+            assert "sekret" not in body
+            assert challenge == "Bearer"
+            assert captured["requests"] == []
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_proxy_forwards_any_caller_when_env_unset(monkeypatch):
+    """Enforcement off (the default) keeps the original local-forwarder behaviour."""
+    monkeypatch.delenv(BEARER_ENV_VAR, raising=False)
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        proxy_runner, proxy_base = await _start_runner(create_app(FakeAdapter(f"{upstream_base}/v1")))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{proxy_base}/v1/chat/completions", json={}) as resp:
+                    await resp.read()
+                    assert resp.status == 200
+            assert len(captured["requests"]) == 1
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_health_stays_open_under_bearer_enforcement(monkeypatch):
+    """/health is never gated — container healthchecks probe it without credentials."""
+    monkeypatch.setenv(BEARER_ENV_VAR, "sekret")
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        proxy_runner, proxy_base = await _start_runner(create_app(FakeAdapter(f"{upstream_base}/v1")))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{proxy_base}/health") as resp:
+                    payload = await resp.json()
+                    assert resp.status == 200
+                    assert payload["status"] == "ok"
+                # ...while the forwarded paths on the same app still demand the bearer.
+                async with session.post(f"{proxy_base}/v1/chat/completions", json={}) as resp:
+                    await resp.read()
+                    assert resp.status == 401
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()

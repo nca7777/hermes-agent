@@ -3,12 +3,20 @@
 A credential-attaching forwarder: request/response bodies are never mediated, logged, or rewritten.
 The one shim: after a *clean* upstream EOF, a ``text/event-stream`` response that carried a terminal
 ``finish_reason`` or ``lastOne: true`` but omitted ``data: [DONE]`` gets a single ``[DONE]`` frame.
+
+The caller's own ``Authorization`` is never forwarded (it is replaced with the resolved upstream
+credential), and it is only *checked* when ``SUBSCRIPTION_PROXY_KEY`` is set — see
+``BEARER_ENV_VAR``. Unset, the proxy forwards any caller, which is safe only when it is reachable
+by nobody but its intended clients.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
+import os
 import signal
 from typing import Optional
 
@@ -27,13 +35,21 @@ from hermes_cli.proxy.sse_done import DONE_SSE_FRAME, SseDoneTracker, content_ty
 logger = logging.getLogger(__name__)
 
 # Stripped when forwarding upstream: ``host``/``content-length`` are recomputed by aiohttp,
-# ``authorization`` is replaced with our bearer; everything else passes through.
+# ``authorization`` is checked against ``BEARER_ENV_VAR`` (when set) and then replaced with our
+# bearer; everything else passes through.
 _HOP_BY_HOP_HEADERS = frozenset({
     "host", "content-length", "connection", "keep-alive", "proxy-authenticate",
     "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "authorization",
 })
 # aiohttp recomputes Content-Encoding/Content-Length on stream — let it.
 _RESPONSE_DROP_HEADERS = _HOP_BY_HOP_HEADERS | {"content-encoding", "content-length"}
+
+# Inbound bearer enforcement. The proxy is a credential-attaching forwarder, so it holds no secret
+# of its own to compare against unless the operator supplies one: when this env var is non-empty the
+# proxy requires a matching inbound ``Authorization: Bearer`` on every forwarded path, and when it is
+# unset any caller is forwarded (the original local-forwarder behaviour). ``/health`` is never gated —
+# container healthchecks and ``hermes proxy status`` probe it without credentials.
+BEARER_ENV_VAR = "SUBSCRIPTION_PROXY_KEY"
 
 DEFAULT_PORT = 8645
 DEFAULT_HOST = "127.0.0.1"
@@ -47,10 +63,24 @@ def _require_aiohttp() -> None:
         raise RuntimeError("aiohttp is required for `hermes proxy`. Run `hermes setup` to install it.")
 
 
-def _json_error(status: int, message: str, code: str = "proxy_error") -> "web.Response":
+def _json_error(status: int, message: str, code: str = "proxy_error",
+                headers: Optional[dict] = None) -> "web.Response":
     """OpenAI-style error JSON response."""
     body = {"error": {"message": message, "type": code, "code": code}}
-    return web.json_response(body, status=status)
+    return web.json_response(body, status=status, headers=headers)
+
+
+def required_bearer() -> str:
+    """The inbound bearer this proxy demands, or ``""`` when enforcement is off."""
+    return (os.environ.get(BEARER_ENV_VAR) or "").strip()
+
+
+def _bearer_matches(request: "web.Request", expected: str) -> bool:
+    """Constant-time check of the caller's ``Authorization: Bearer`` against ``expected``."""
+    scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+    return hmac.compare_digest(token.strip().encode(), expected.encode())
 
 
 def _filter_headers(headers, drop: frozenset = _HOP_BY_HOP_HEADERS) -> dict:
@@ -135,12 +165,29 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
     app = web.Application(client_max_size=MAX_REQUEST_BYTES)
     # AppKey: forward-compat with aiohttp versions that strip bare-string keys.
     app[web.AppKey("adapter", UpstreamAdapter)] = adapter
+    # Resolved once at app construction: flipping the env var takes a restart, which is what a
+    # rotation already requires. Never logged — the fingerprint is enough to tell which value is live.
+    expected_bearer = required_bearer()
+    if expected_bearer:
+        logger.info(
+            "proxy: inbound bearer enforcement ON (%s sha12=%s)",
+            BEARER_ENV_VAR, hashlib.sha256(expected_bearer.encode()).hexdigest()[:12],
+        )
+    else:
+        logger.info("proxy: inbound bearer enforcement OFF (%s unset) — any caller is forwarded", BEARER_ENV_VAR)
 
     async def handle_health(request: "web.Request") -> "web.Response":
         authenticated = await asyncio.to_thread(adapter.is_authenticated)
         return web.json_response({"status": "ok", "upstream": adapter.display_name, "authenticated": authenticated})
 
     async def handle_proxy(request: "web.Request") -> "web.StreamResponse":
+        if expected_bearer and not _bearer_matches(request, expected_bearer):
+            return _json_error(
+                401,
+                f"Invalid or missing bearer token. This proxy requires the {BEARER_ENV_VAR} value.",
+                code="invalid_api_key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         rel_path = "/" + request.match_info.get("tail", "").lstrip("/")
         if rel_path not in adapter.allowed_paths:
             allowed = ", ".join(sorted(adapter.allowed_paths))
@@ -210,4 +257,7 @@ async def run_server(
         await runner.cleanup()
 
 
-__all__ = ["create_app", "run_server", "DEFAULT_HOST", "DEFAULT_PORT", "AIOHTTP_AVAILABLE"]
+__all__ = [
+    "create_app", "run_server", "required_bearer", "BEARER_ENV_VAR",
+    "DEFAULT_HOST", "DEFAULT_PORT", "AIOHTTP_AVAILABLE",
+]

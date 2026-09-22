@@ -9,7 +9,7 @@ from typing import Any
 
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.server import (
-    AIOHTTP_AVAILABLE, DEFAULT_HOST, DEFAULT_PORT, run_server
+    AIOHTTP_AVAILABLE, BEARER_ENV_VAR, DEFAULT_HOST, DEFAULT_PORT, required_bearer, run_server
 )
 
 logger = logging.getLogger(__name__)
@@ -36,11 +36,21 @@ def cmd_proxy_start(args: Any) -> int:
         return 2
     host = getattr(args, "host", None) or DEFAULT_HOST
     port = getattr(args, "port", None) or DEFAULT_PORT
+    expected_bearer = required_bearer()
+    if expected_bearer:
+        auth_line = (
+            f"  Inbound auth:  required — clients must send `Authorization: Bearer ${BEARER_ENV_VAR}`\n"
+        )
+    else:
+        auth_line = (
+            "  Inbound auth:  off — any bearer token is accepted (the proxy attaches your real\n"
+            f"                 credential). Set {BEARER_ENV_VAR} to require a matching bearer.\n"
+        )
     _err(
         f"Starting Hermes proxy for {adapter.display_name}\n"
         f"  Listening on:  http://{host}:{port}/v1\n"
         f"  Forwarding to: (resolved per-request from your subscription)\n"
-        f"  Use any bearer token in the client — the proxy attaches your real credential.\n"
+        f"{auth_line}"
         f"\n"
         f"Press Ctrl+C to stop."
     )
