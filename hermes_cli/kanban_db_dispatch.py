@@ -278,6 +278,140 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     return int(matches[-1]) if matches else None
 
 
+# ---------------------------------------------------------------------------
+# Own-cgroup OOM kills: detection + escalation
+# ---------------------------------------------------------------------------
+# Every worker scope carries ``MemoryMax=<worker ceiling>``
+# (``tools/process_registry.py::_systemd_scope_argv``). When the work inside it
+# needs more than that, the kernel OOM-kills the fattest process in the scope and
+# systemd then kills the rest of the unit with SIGKILL — so the card dies with no
+# exit trailer and no terminal board call, and is reclaimed as a generic crash
+# (``pid N not alive``). Nothing distinguishes it from a broken card, so the
+# dispatcher re-spawns identical work onto the same wall: killed, requeued,
+# killed, until a human happens to read the card.
+#
+# The kill IS recorded, just not where ``systemctl`` can be asked afterwards:
+# ``--collect`` unloads the transient unit the moment it dies, so
+# ``systemctl --user show -p Result <unit>`` answers with defaults
+# (``Result=success``) for a scope that was OOM-killed — verified. The user
+# journal keeps the record, keyed on the deterministic unit name
+# ``_restart_safe_worker_argv`` builds:
+# ``hermes-worker-kanban-<task>-run-<run>.scope``.
+_OOM_KILL_JOURNAL_TIMEOUT_SECONDS = 5.0
+_OOM_KILL_RESULT_RE = re.compile(r"Failed with result 'oom-kill'")
+_OOM_MEMORY_PEAK_RE = re.compile(r"(\S+)\s+memory peak")
+
+# Own-cgroup OOM deaths before the card is escalated to an operator. Deliberately a
+# TOTAL read off the run history, not ``consecutive_failures``: an operator unblock
+# resets that counter by design (the card's cause may have been fixed), so only a
+# durable count stops "block -> unblock -> identical OOM kill" from running forever.
+# One more than the default ``failure_limit``, so the ordinary breaker still blocks
+# the card first; this fires when the SAME card proves the wall is memory.
+OOM_KILL_ESCALATION_LIMIT = 3
+
+
+def _worker_scope_unit(task_id: str, run_id: Optional[int]) -> Optional[str]:
+    """The systemd unit name a worker of ``task_id`` ran in, or None when unknown."""
+    if not task_id or run_id is None:
+        return None
+    return f"hermes-worker-kanban-{task_id}-run-{int(run_id)}.scope"
+
+
+def read_worker_oom_kill_evidence(task_id: str, run_id: Optional[int]) -> Optional[dict]:
+    """Own-cgroup OOM evidence for a dead worker, or ``None``.
+
+    ``{"unit", "memory_peak", "lines"}`` when systemd recorded ``Failed with
+    result 'oom-kill'`` for the worker's scope. Best-effort by design: any failure
+    to read the journal (no journal, no permission, no ``journalctl``) returns
+    ``None`` and the death keeps its generic crash booking.
+    """
+    unit = _worker_scope_unit(task_id, run_id)
+    if unit is None or _kb._IS_WINDOWS:
+        return None
+    env = None
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        runtime = f"/run/user/{os.getuid()}"  # windows-footgun: ok — behind the _IS_WINDOWS return above
+        if os.path.isdir(runtime):
+            env = {**os.environ, "XDG_RUNTIME_DIR": runtime}
+    try:
+        proc = subprocess.run(
+            ["journalctl", "--user", "--unit", unit, "--no-pager", "-o", "cat", "-n", "60"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=_OOM_KILL_JOURNAL_TIMEOUT_SECONDS, check=False, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    if not any(_OOM_KILL_RESULT_RE.search(ln) for ln in lines):
+        return None
+    peak = next(
+        (match.group(1) for ln in lines for match in [_OOM_MEMORY_PEAK_RE.search(ln)] if match),
+        None,
+    )
+    return {"unit": unit, "memory_peak": peak, "lines": lines[-6:]}
+
+
+def _oom_kill_deaths(conn: sqlite3.Connection, task_id: str) -> int:
+    """Total runs of ``task_id`` whose worker died of its own cgroup's OOM killer.
+
+    The death being accounted is already counted: ``_reclaim_dead_workers`` closes
+    its run with ``outcome='oom_killed'`` before ``_account_crashes`` runs.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ? AND outcome = 'oom_killed'",
+        (task_id,),
+    ).fetchone()
+    return int(row["n"]) if row is not None else 0
+
+
+def _oom_kill_error_text(pid: int, evidence: Mapping[str, Any]) -> str:
+    """The persisted failure text for an own-cgroup OOM death.
+
+    Names the ceiling that was hit and the one action that cannot work, because the
+    operator reading this card is the only one who can split the work: the worker
+    ceiling is deliberate isolation (widening it trades a contained worker death for
+    a host-wide OOM), so "give it more memory" is never the fix.
+    """
+    peak = evidence.get("memory_peak")
+    return (
+        f"pid {pid} was OOM-killed inside its own worker cgroup"
+        + (f" ({peak} memory peak)" if peak else "")
+        + f" [unit {evidence.get('unit')}]: the kernel hit the scope's MemoryMax, so this work "
+        "needs more memory than one worker is allowed. Split the card, or hand the heavy step to "
+        "a tracked background process outside the worker scope."
+    )
+
+
+def _oom_killed_dead_worker(
+    pid: int,
+    claimer: Optional[str],
+    evidence: Mapping[str, Any],
+    *,
+    exit_kind: Optional[str] = None,
+    exit_code: Optional[int] = None,
+) -> _DeadWorker:
+    """How a worker the kernel OOM-killed inside its own scope is booked.
+
+    One construction site for both detection paths (no trailer at all, and a trailer
+    too stale to trust) so the outcome, the event kind and the evidence keys cannot
+    drift apart between them. ``exit_kind``/``exit_code`` are passed only when THIS
+    run observed them; a trailer-derived code may belong to an earlier run of the
+    same card, and naming it as this death's exit code would be a fiction.
+    """
+    return _DeadWorker(
+        "oom_killed", exit_code, _oom_kill_error_text(pid, evidence), "crashed",
+        {
+            "pid": pid, "claimer": claimer, "exit_kind": exit_kind, "exit_code": exit_code,
+            "oom_killed": True, "systemd_unit": evidence["unit"],
+            "memory_peak": evidence.get("memory_peak"),
+        },
+        oom_killed=True,
+    )
+
+
 def reap_worker_zombies() -> "list[int]":
     """Reap exited workers without blocking; returns reaped PIDs. POSIX reaps
     every child via ``waitpid(-1)``; Windows polls the ``Popen`` handles
@@ -1027,16 +1161,25 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    oom_killed: bool = False
+    """The worker's own scope hit ``MemoryMax`` (kernel memcg OOM kill). Booked as a
+    distinct outcome so the board can tell "needs more memory than one worker gets"
+    apart from "this work is broken"."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        if self.rate_limited:
+            return "rate_limited"
+        # An own-cgroup OOM kill gets its own outcome for the same reason:
+        # ``crashed`` would hide the one thing the operator needs to see.
+        return "oom_killed" if self.oom_killed else "crashed"
 
 
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
@@ -1044,7 +1187,7 @@ def _classify_dead_worker(
     in the event payload, appended to the error text) so the board and the retry
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
     """
-    dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
+    dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board, run_id=run_id)
     if task_id and not dead.rate_limited:
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
@@ -1059,6 +1202,7 @@ def _classify_dead_worker_exit(
     *,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> _DeadWorker:
     """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
 
@@ -1066,13 +1210,37 @@ def _classify_dead_worker_exit(
     reads the exit trailer the worker left in its log instead, so the same death
     gets the same booking (protocol violation / rate-limit requeue / crash) as
     under the gateway-embedded dispatcher. A worker that never reached its exit
-    epilogue (killed, OOM) leaves no trailer and stays a plain crash.
+    epilogue (killed, OOM) leaves no trailer; an own-cgroup OOM kill is then
+    confirmed against the scope's journal (``read_worker_oom_kill_evidence``) and
+    booked as ``oom_killed`` instead of a bare crash.
+
+    A trailer-derived classification is checked against the journal FIRST, before
+    any of it is trusted: see the comment on the probe below.
     """
     kind, code = _classify_worker_exit(pid)
+    kind_from_trailer = False
     if kind == "unknown" and task_id:
         logged = _worker_log_exit_code(task_id, board=board)
         if logged is not None:
             kind, code = _exit_code_kind(logged)
+            kind_from_trailer = True
+    if task_id is not None and kind_from_trailer:
+        # A trailer is NOT per-run, so it cannot vouch for this death. The log is
+        # append-mode across re-runs (``_open_worker_log``) and
+        # ``_worker_log_exit_code`` takes the last trailer of its 4 KB tail, so a
+        # re-run that wrote little before dying is classified by a PREVIOUS run's
+        # exit code. The scope's journal cannot be stale — its unit name carries
+        # this run's id (``_worker_scope_unit``) — so ask it before trusting the
+        # trailer. Without this, an own-cgroup OOM death that left a stale ``rc=0``
+        # trailer behind is booked as that trailer's protocol violation: the durable
+        # OOM count does not move, the escalation never arms, and the operator reads
+        # "worker exited cleanly (rc=0) without kanban_complete" for a card the
+        # kernel OOM-killed. One bounded subprocess per trailer-classified death.
+        evidence = read_worker_oom_kill_evidence(task_id, run_id)
+        if evidence is not None:
+            # No exit_kind/exit_code: whatever the trailer named may belong to an
+            # earlier run, and reporting it as THIS death's code would be a fiction.
+            return _oom_killed_dead_worker(pid, claimer, evidence)
     if kind == "clean_exit":
         # rc=0 while still ``running``: usually the work succeeded and only the
         # paperwork was skipped; the corrective sentence reaches the retry
@@ -1107,6 +1275,16 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "terminal_provider": True},
             terminal_provider=True,
         )
+    if task_id is not None and not kind_from_trailer:
+        # Nothing the worker wrote can describe a SIGKILL, so ask the scope itself:
+        # its journal entry outlives the collected transient unit (see the block
+        # comment above ``_OOM_KILL_JOURNAL_TIMEOUT_SECONDS``). Trailers were already
+        # checked against the same journal before the ``clean_exit`` branch above, so
+        # this probe is only reached for a death with no trailer at all — one bounded
+        # subprocess per crash-classified death, never two.
+        evidence = read_worker_oom_kill_evidence(task_id, run_id)
+        if evidence is not None:
+            return _oom_killed_dead_worker(pid, claimer, evidence, exit_kind=kind, exit_code=code)
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -1139,7 +1317,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, "
+            "current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1157,7 +1336,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
 
             pid = int(row["worker_pid"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            dead = _classify_dead_worker(
+                pid, row["claim_lock"], task_id=row["id"], board=board,
+                run_id=_kb._row_get(row, "current_run_id"),
+            )
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1263,6 +1445,30 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
+            )
+        elif dead.oom_killed:
+            # The card's work does not fit in one worker, which a retry cannot
+            # change. Account the death normally (the ordinary breaker still gets
+            # its ``failure_limit`` attempts) and escalate once the SAME card has
+            # died this way ``OOM_KILL_ESCALATION_LIMIT`` times in total: unlike
+            # ``consecutive_failures`` an operator unblock does not reset that
+            # count, so the loop cannot be restarted by pressing the same button.
+            deaths = _oom_kill_deaths(conn, tid)
+            escalate = deaths >= OOM_KILL_ESCALATION_LIMIT
+            extra = {
+                "pid": pid, "claimer": claimer, "oom_killed": True, "oom_deaths": deaths,
+                "oom_escalation_limit": OOM_KILL_ESCALATION_LIMIT,
+            }
+            if escalate:
+                extra["sticky"] = True
+            tripped = _record_task_failure(
+                conn, tid,
+                error=error_text,
+                outcome="oom_killed",
+                force_trip=escalate,
+                release_claim=False,
+                end_run=False,
+                event_payload_extra=extra,
             )
         else:
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
@@ -1551,10 +1757,12 @@ def check_respawn_guard(
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # benign commands such as ``claude auth status`` (#117097). An own-cgroup OOM
+    # kill (``oom_killed``) shares that exemption for the same reason, and its
+    # text is already the diagnosis.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if err and latest_outcome not in ("crashed", "oom_killed") and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
