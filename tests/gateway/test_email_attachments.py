@@ -28,6 +28,12 @@ from unittest.mock import patch
 
 MODULE = "plugins.platforms.email.adapter"
 
+try:  # the base install ships pillow-heif; a stripped environment may not
+    from pillow_heif import register_heif_opener as _register_heif
+    _HEIF_CODEC = True
+except ImportError:
+    _HEIF_CODEC = False
+
 
 @contextmanager
 def _temp_home():
@@ -133,7 +139,7 @@ class TestPictureFormats(unittest.TestCase):
         self.assertTrue(attachments[0]["path"].endswith(".png"))
 
     def test_an_undecodable_picture_degrades_to_a_document(self):
-        """A .heic without an HEIC decoder must stay usable as a file, never be dropped."""
+        """A picture with no available decoder must stay usable as a file, never be dropped."""
         with _temp_home():
             attachments = _loaded()._extract_attachments(self._attach(b"\x00\x00\x00 ftypheic broken", "IMG_1.heic", "heic"))
             on_disk = Path(attachments[0]["path"]).is_file() if attachments else False
@@ -141,6 +147,24 @@ class TestPictureFormats(unittest.TestCase):
         self.assertEqual(len(attachments), 1)
         self.assertEqual(attachments[0]["type"], "document")
         self.assertTrue(on_disk)
+
+    @unittest.skipUnless(_HEIF_CODEC, "pillow-heif not installed in this environment")
+    def test_an_iphone_heic_picture_is_cached_as_an_image_png(self):
+        """The default iPhone camera format must reach vision, not the document cache."""
+        import io
+        from PIL import Image
+        from pillow_heif import register_heif_opener
+        register_heif_opener()  # so Pillow can WRITE the sample the adapter must read
+        buffer = io.BytesIO()
+        Image.new("RGB", (48, 32), "white").save(buffer, format="HEIF")
+
+        with _temp_home():
+            attachments = _loaded()._extract_attachments(
+                self._attach(buffer.getvalue(), "IMG_0002.HEIC", "heic"))
+
+        self.assertEqual(attachments[0]["type"], "image")
+        self.assertEqual(attachments[0]["media_type"], "image/png")
+        self.assertTrue(attachments[0]["path"].endswith(".png"))
 
     def test_skip_attachments_still_caches_nothing(self):
         with _temp_home():
