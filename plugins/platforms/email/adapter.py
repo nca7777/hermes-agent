@@ -48,6 +48,9 @@ MAX_MESSAGE_LENGTH = 50_000  # Gmail-safe max length per email body
 SMTP_CONNECT_TIMEOUT = 30
 _TRUTHY = {"true", "1", "yes"}
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+# Picture formats a camera/scanner produces that the model API will NOT take inline (.heic is the
+# default iPhone format). Cached as an image only after transcoding to PNG, never passed through raw.
+_TRANSCODE_IMAGE_EXTS = {".bmp", ".tif", ".tiff", ".heic", ".heif", ".avif"}
 # Charset labels seen in the wild that Python's codec registry doesn't know: "unknown-8bit"/"x-unknown" are
 # RFC 1428 placeholders (QQ Mail emits them); gb2312/gbk map to the gb18030 superset so GBK extensions decode.
 _CHARSET_ALIASES = {"unknown-8bit": "utf-8", "unknown": "utf-8", "x-unknown": "utf-8", "default": "utf-8",
@@ -268,6 +271,103 @@ def _extract_text_body(msg: email_lib.message.Message) -> str:
     return _strip_html(text) if msg.get_content_type() == "text/html" else text
 
 
+def _forwarded_messages(msg: email_lib.message.Message, _seen: Optional[set] = None, depth: int = 0):
+    """Yield every message carried INSIDE *msg* as a ``message/rfc822`` part, nested included.
+
+    A mail client's "Forward as attachment" wraps the original as a ``message/rfc822`` part, so the
+    original is a *message*, not a part with its own text. ``walk()`` reaches the same part object
+    from an outer and an inner walk of a doubly-nested forward, hence the identity set.
+    """
+    if depth > 2:  # a forward of a forward of a forward is deep enough for a mailbox channel
+        return
+    seen = _seen if _seen is not None else set()
+    for part in msg.walk():
+        if part.get_content_type() != "message/rfc822" or id(part) in seen:
+            continue
+        seen.add(id(part))
+        payload = part.get_payload()
+        for inner in (payload if isinstance(payload, list) else [payload]):
+            if isinstance(inner, email_lib.message.Message):
+                yield inner
+                yield from _forwarded_messages(inner, seen, depth + 1)
+
+
+def _extract_forwarded_text(msg: email_lib.message.Message) -> str:
+    """Text of every mail forwarded INSIDE *msg*, labelled with its own headers.
+
+    Without this the body of a forwarded mail is only the forwarder's covering line: the original
+    sits in a nested ``message/rfc822`` part, and ``_first_body_part`` reads only the first
+    non-attachment part of the OUTER message. The agent then answers from "see below" alone and
+    cannot tell that the original's content was withheld.
+    """
+    blocks = []
+    for index, inner in enumerate(_forwarded_messages(msg), start=1):
+        text = _extract_text_body(inner).strip()
+        if not text:
+            continue
+        headers = [f"{label}: {value}" for label, value in (
+            ("From", _decode_header_value(inner.get("From", ""))), ("Date", inner.get("Date", "")),
+            ("Subject", _decode_header_value(inner.get("Subject", "")))) if value]
+        head = f"\n{chr(10).join(headers)}" if headers else ""
+        blocks.append(f"---------- Forwarded message {index} ----------{head}\n\n{text}")
+    return "\n\n".join(blocks)
+
+
+def _compose_body(msg: email_lib.message.Message) -> str:
+    """Body text of *msg* plus the text of any mail forwarded inside it as an attachment."""
+    body = _extract_text_body(msg).strip()
+    forwarded = _extract_forwarded_text(msg)
+    if not forwarded:
+        return body
+    return f"{body}\n\n{forwarded}".strip() if body else forwarded
+
+
+def _transcode_image_to_png(payload: bytes) -> Optional[bytes]:
+    """PNG bytes for an image the model API will not take inline, or None when it cannot be decoded."""
+    try:
+        import io
+
+        from PIL import Image
+        with suppress(Exception):  # optional: only needed for HEIC/AVIF
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+        with Image.open(io.BytesIO(payload)) as image:
+            buffer = io.BytesIO()
+            image.convert("RGB").save(buffer, format="PNG")
+            return buffer.getvalue()
+    except Exception:  # noqa: BLE001 — any decode failure means "hand it over as a file instead"
+        return None
+
+
+def _cache_attachment(payload: bytes, filename: str, content_type: str) -> Dict[str, Any]:
+    """Cache one attachment and describe it for the dispatch dict.
+
+    ``_IMAGE_EXTS`` are the formats the model API accepts inline, so a picture reaches the model's
+    own vision. A picture in another format a camera or scanner produces (.bmp/.tif/.heic) is
+    transcoded to PNG first; only a payload that cannot be decoded becomes a document, because a
+    document appears to the agent as an opaque file path rather than something it can look at.
+    """
+    ext = Path(filename).suffix.lower()
+    if ext in _IMAGE_EXTS:
+        try:
+            path = cache_image_from_bytes(payload, ext)
+        except ValueError:
+            logger.debug("Skipping non-image attachment %s (invalid magic bytes)", filename)
+            return {}
+        return {"path": path, "filename": filename, "type": "image", "media_type": content_type or "image/jpeg"}
+    if ext in _TRANSCODE_IMAGE_EXTS or (content_type or "").startswith("image/"):
+        png = _transcode_image_to_png(payload)
+        if png:
+            # run.py keys image handling off the per-path media type, so it must describe the bytes
+            # actually cached (PNG), not the name the sender used.
+            stem = Path(filename).stem or "image"
+            return {"path": cache_image_from_bytes(png, ".png"), "filename": f"{stem}.png",
+                    "type": "image", "media_type": "image/png"}
+        logger.debug("Could not decode %s as an image; passing it through as a document", filename)
+    return {"path": cache_document_from_bytes(payload, filename), "filename": filename,
+            "type": "document", "media_type": content_type}
+
+
 def _strip_html(html: str) -> str:
     """Naive HTML tag stripper for fallback text extraction."""
     for pattern, repl in _HTML_SUBS:
@@ -338,21 +438,19 @@ def _extract_attachments(msg: email_lib.message.Message, skip_attachments: bool 
         return attachments
     for part in msg.walk():
         disposition, content_type = str(part.get("Content-Disposition", "")), part.get_content_type()
-        if skip_attachments or ("attachment" not in disposition and (
-                "inline" not in disposition or content_type in {"text/plain", "text/html"})):
+        # A message/rfc822 container carries no bytes of its own (its ``get_payload(decode=True)`` is
+        # None): its TEXT is inlined into the body by _extract_forwarded_text, and its own attachments
+        # are reached by walk() on their own pass, so there is nothing to cache here.
+        if skip_attachments or content_type == "message/rfc822":
+            continue
+        if "attachment" not in disposition and ("inline" not in disposition or content_type in {"text/plain", "text/html"}):
             continue  # not an attachment, or an inline text/html body part
         filename = _decode_header_value(fn) if (fn := part.get_filename()) else f"attachment.{part.get_content_subtype() or 'bin'}"
         if not (payload := part.get_payload(decode=True)):
             continue
-        if (ext := Path(filename).suffix.lower()) in _IMAGE_EXTS:
-            try:
-                cached_path, kind = cache_image_from_bytes(payload, ext), "image"
-            except ValueError:
-                logger.debug("Skipping non-image attachment %s (invalid magic bytes)", filename)
-                continue
-        else:
-            cached_path, kind = cache_document_from_bytes(payload, filename), "document"
-        attachments.append({"path": cached_path, "filename": filename, "type": kind, "media_type": content_type})
+        cached = _cache_attachment(payload, filename, content_type)
+        if cached:
+            attachments.append(cached)
     return attachments
 
 
@@ -839,7 +937,7 @@ class EmailAdapter(BasePlatformAdapter):
         return {"uid": uid, "sender_addr": sender_addr, "sender_name": sender_name, "subject": subject,
                 "message_id": msg.get("Message-ID", ""), "in_reply_to": msg.get("In-Reply-To", ""),
                 "thread_key": _thread_key_of(msg), "recipients": _recipients_of(msg),
-                "body": _extract_text_body(msg),
+                "body": _compose_body(msg),
                 "attachments": _extract_attachments(msg, skip_attachments=self._skip_attachments),
                 "date": msg.get("Date", ""), "sender_authenticated": sender_authenticated, "auth_reason": auth_reason}
 
