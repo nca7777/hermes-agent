@@ -33,6 +33,7 @@ ANYDOC_EXTENSIONS = frozenset({
     ".xls", ".xlsm", ".xlsb", ".odt", ".ods", ".odp", ".rtf", ".epub", ".pdf"})
 # anydoc loads whole files (no streaming); read_file's char budget applies only post-conversion.
 MAX_ANYDOC_BYTES = 50 * 1024 * 1024
+LOCAL_OCR_TIMEOUT = 300.0  # a scanned page set on CPU takes seconds per page; a hang must not wedge read_file
 MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
@@ -189,9 +190,52 @@ def _finalize_anydoc_text(text: Any, path: str, pdf_note: Callable[[], str]) -> 
     return (pdf_note() if Path(path).suffix.lower() == ".pdf" else "") + text.rstrip("\n") + "\n"
 
 
+def _local_ocr_command() -> Optional[str]:
+    """The deployment's own OCR command for scanned pages (``file_tools.ocr_command``), or None.
+
+    A scanned PDF is a page of pixels: with no text layer its content is simply absent, and no
+    amount of extraction invents it. This is deliberately a COMMAND the deployment names instead of
+    a bundled engine — OCR models run to hundreds of megabytes, and a host that already has
+    tesseract, ocrmypdf or an ONNX engine should point at whichever one it runs. Unset keeps the
+    historic "needs OCR" warning, so an unconfigured deployment behaves exactly as before.
+    """
+    with contextlib.suppress(Exception):  # a config read must never break extraction
+        from hermes_cli.config import load_config_readonly
+        section = load_config_readonly().get("file_tools")
+        if isinstance(section, dict):
+            return str(section.get("ocr_command") or "").strip() or None
+    return None
+
+
+def _run_local_ocr(path: str) -> str:
+    """Text of *path* from the configured OCR command, or '' when unset/failed.
+
+    The command takes the document path as its last argument and prints the text on stdout. It runs
+    WITHOUT a shell, so a configured value cannot smuggle in shell syntax.
+    """
+    command = _local_ocr_command()
+    if not command:
+        return ""
+    try:
+        argv = shlex.split(command)
+    except ValueError:  # unbalanced quotes in the configured value
+        return ""
+    if not argv:
+        return ""
+    try:
+        proc = subprocess.run(argv + [path], capture_output=True, timeout=LOCAL_OCR_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout.decode("utf-8", errors="replace").strip() if proc.returncode == 0 else ""
+
+
 def _ocr_scanned_pdf(mod: Any, path: str, exc: BaseException) -> str:
-    """anydoc >= 0.2 scanned-pages signal: hosted OCR when a route exists, else teach recovery."""
+    """anydoc >= 0.2 scanned-pages signal: local OCR first (free, offline), then hosted, else teach recovery."""
     pages = list(getattr(exc, "pages", []) or [])
+    page_list = ", ".join(str(p) for p in pages) if pages else "unknown"
+    local = _run_local_ocr(path)
+    if local:
+        return f"[text recovered from scanned pages {page_list} by the configured local OCR]\n{local}\n"
     enabled, api_key, api_url = _hosted_ocr_config()
     hosted_error = ""
     if enabled:
@@ -231,6 +275,12 @@ def _extract_anydoc_bytes(data: bytes, path: str) -> str:
     try:
         text = mod.to_markdown_bytes(data)
     except Exception as exc:
+        needs_ocr = getattr(mod, "NeedsOcrError", None)
+        if needs_ocr is not None and isinstance(exc, needs_ocr) and _extension(path) == ".pdf":
+            # read_file hands documents over as BYTES, and this is the path a scanned PDF arrives
+            # through. An OCR engine reads files, so materialize the bytes for the duration of the run.
+            with _temp_copy(data, ".pdf") as temp_path:
+                return _ocr_scanned_pdf(mod, temp_path, exc)
         raise ExtractionError(f"{type(exc).__name__}: {exc}") from exc
     return _finalize_anydoc_text(text, path, lambda: _pdf_coverage_note_from_bytes(data, path))
 
