@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from abc import ABC, abstractmethod
 from contextlib import closing, suppress
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# A hop restart (host reboot, OOM kill, `docker restart`, a Coolify recreate of that one service)
+# opens a window the start-order dependency cannot cover: the API is still serving, mem0 accepts an
+# `infer=true` POST /memories, the dial to the extraction hop fails, and the server answers
+# `502 provider_unavailable` in ~0.1 s. Nothing retried it, so the turn was lost outright.
+# Retry the extraction write in place (it already runs on the background sync thread, so the
+# user-facing turn is never blocked); the `infer=false` fast path is single-shot and unchanged.
+_SYNC_RETRY_ATTEMPTS = 3  # 1 try + 2 retries
+_SYNC_RETRY_BACKOFF_SECS = (2.0, 5.0)
+_TRANSIENT_STATUS = (502, 503)
+_PROVIDER_UNAVAILABLE = "provider_unavailable"
 
 
 def _add_kwargs(user_id: str, agent_id: str, infer: bool, metadata: dict | None) -> dict[str, Any]:
@@ -14,6 +29,51 @@ def _add_kwargs(user_id: str, agent_id: str, infer: bool, metadata: dict | None)
 def _unwrap_results(response: Any) -> list:
     """Normalize API response — extract results list from dict or pass through."""
     return response.get("results", []) if isinstance(response, dict) else response if isinstance(response, list) else []
+
+
+def _is_transient_upstream(exc: BaseException) -> bool:
+    """True only for a failure that provably did NOT store anything and may self-heal.
+
+    Two cases, both narrow on purpose:
+      * the server answered 502/503 — its own ``provider_unavailable`` classification, or a proxy's
+        plain bad-gateway while a container is recreated: the request was answered, nothing stored;
+      * the socket never connected (dead hop, connect timeout): nothing reached the server.
+    A read timeout is deliberately NOT retried — the request may already have been stored, and a
+    retry would then duplicate the memory. A 4xx is the caller's problem: never retried.
+    """
+    import httpx
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        if response.status_code not in _TRANSIENT_STATUS:
+            return False
+        try:
+            code = (response.json() or {}).get("code")
+        except Exception:  # a proxy's HTML error page carries no classified body
+            return True
+        return code in (None, _PROVIDER_UNAVAILABLE)
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
+def _retry_transient(call, *, attempts: int | None = None, backoff: tuple | None = None, sleep=time.sleep, log=logger):
+    """Run ``call`` while it fails transiently, then re-raise the last error.
+
+    The final error still propagates, so the memory plugin's circuit breaker and its
+    ``Mem0 sync failed`` warning keep firing exactly as before: a client-side retry hides no
+    outage — each attempt that reaches the server is still counted by ``GET /metrics``.
+    """
+    attempts = _SYNC_RETRY_ATTEMPTS if attempts is None else max(1, attempts)
+    backoff = _SYNC_RETRY_BACKOFF_SECS if backoff is None else backoff
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if attempt == attempts or not _is_transient_upstream(exc):
+                raise
+            delay = backoff[min(attempt - 1, len(backoff) - 1)]
+            log.info("Mem0 extraction write hit a transient upstream error (%s); retrying in %.1fs (%d of %d retries)", exc, delay, attempt, attempts - 1)
+            sleep(delay)
+    raise RuntimeError("unreachable: _retry_transient with attempts >= 1 always returns or raises")
 
 
 class Mem0Backend(ABC):
@@ -87,7 +147,10 @@ class SelfHostedBackend(Mem0Backend):
         return _unwrap_results(self._json("POST", "/search", json=payload))
 
     def add(self, messages: list, *, user_id: str, agent_id: str, infer: bool = False, metadata: dict | None = None) -> dict:
-        return self._json("POST", "/memories", json={"messages": messages, **_add_kwargs(user_id, agent_id, infer, metadata)})
+        payload = {"messages": messages, **_add_kwargs(user_id, agent_id, infer, metadata)}
+        if not infer:
+            return self._json("POST", "/memories", json=payload)  # explicit write: single-shot, unchanged
+        return _retry_transient(lambda: self._json("POST", "/memories", json=payload))
 
     def _update(self, memory_id: str, text: str) -> None:
         self._json("PUT", f"/memories/{memory_id}", json={"text": text})

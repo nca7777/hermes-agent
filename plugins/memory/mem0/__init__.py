@@ -23,6 +23,8 @@ from agent.secret_scope import get_secret
 from tools.registry import tool_error
 from utils import atomic_json_write, read_json_or_empty
 
+from . import _backend as _mem0_backend
+
 logger = logging.getLogger(__name__)
 
 # Circuit breaker: after _BREAKER_THRESHOLD consecutive failures, pause API
@@ -41,6 +43,14 @@ _DEFAULT_USER_ID = "hermes-user"
 # The default fits a 512-token embedder (measured: 450 OK, 600 -> HTTP 500 on
 # bge-small-zh-v1.5:f16); ``sync_max_chars`` in mem0.json raises it for larger windows.
 _SYNC_MSG_MAX_CHARS = 450
+
+# The sync thread may spend the backend's retry budget (see _backend._SYNC_RETRY_*), so it can now
+# outlive one extraction by several seconds. A turn arriving while the previous sync is still running
+# was skipped outright — with a retry in flight that would trade the write it just saved for a lost
+# next turn. Wait long enough for a retrying write to finish; only a genuinely wedged sync is skipped.
+# The caller is the memory manager's background worker (never the turn loop), so this wait delays
+# nothing the user sees.
+_SYNC_JOIN_SECS = 5.0 + sum(_mem0_backend._SYNC_RETRY_BACKOFF_SECS) + 10.0
 
 
 # Sentence ends recognized when trimming a synced message. Deliberately unordered:
@@ -316,7 +326,7 @@ class Mem0MemoryProvider(MemoryProvider):
         with self._sync_lock:
             prev = self._sync_thread
             if prev and prev.is_alive():
-                prev.join(timeout=5.0)
+                prev.join(timeout=_SYNC_JOIN_SECS)
                 if prev.is_alive():  # still busy after the wait: skip to avoid duplicate ingestion
                     return
             self._sync_thread = spawn_context_thread(_sync, name="mem0-sync")
