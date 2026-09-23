@@ -185,6 +185,30 @@ def _is_automated_sender(address: str, headers: dict) -> bool:
         (value := headers.get(header, "")) and check(value) for header, check in _AUTOMATED_HEADERS.items())
 
 
+def _is_inbox(mailbox: str) -> bool:
+    """True for INBOX — IMAP's one case-insensitive, never-renamed, always-present mailbox."""
+    return mailbox.strip().upper() == "INBOX"
+
+
+def _parse_mailboxes(raw: Any) -> List[str]:
+    """Mailboxes the poller reads: INBOX first, then the configured ones, deduped (empty/unset ⇒ INBOX alone).
+
+    A server-side rule (Fastmail files channel mail into a folder of your choosing) can move mail out
+    of INBOX, which leaves the channel deaf; ``EMAIL_MAILBOXES`` / ``platforms.email.mailboxes`` names
+    the folders to read as well. INBOX is always polled — the setting ADDS mailboxes, and a list that
+    omitted it would go deaf the moment a rule fired. Accepts the comma-separated env/YAML string and
+    a YAML list.
+    """
+    names = raw if isinstance(raw, (list, tuple)) else str(raw or "").split(",")
+    mailboxes, seen = ["INBOX"], {"inbox"}
+    for name in names:
+        label = str(name).strip()
+        if label and label.lower() not in seen:
+            seen.add(label.lower())
+            mailboxes.append(label)
+    return mailboxes
+
+
 def check_email_requirements() -> bool:
     """True when all email settings are present and non-blank (blank keys left by an abandoned setup must not enable the platform).
 
@@ -371,9 +395,10 @@ def _thread_key_of(msg) -> str:
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
 
-    # Per-account seen-UID snapshot surviving adapter recreation: the reconnect watcher builds a FRESH
-    # adapter per retry; without this connect(is_reconnect=True) would re-mark the mailbox seen and skip
-    # mail that arrived during the outage. Keyed by address (multiplex runs several accounts); same-process only.
+    # Per-account, per-mailbox seen-UID snapshot surviving adapter recreation: the reconnect watcher
+    # builds a FRESH adapter per retry; without this connect(is_reconnect=True) would re-mark the
+    # mailbox seen and skip mail that arrived during the outage. Keyed by _snapshot_key (address for
+    # INBOX; multiplex runs several accounts); same-process only.
     _seen_uids_snapshot: Dict[str, set] = {}
 
     def __init__(self, config: PlatformConfig):
@@ -417,11 +442,27 @@ class EmailAdapter(BasePlatformAdapter):
         # arriving mail read within seconds, so an UNSEEN search silently misses mail the operator
         # sent. "uid" keeps a high-water mark instead and never consults \Seen.
         self._poll_mode = (setting("EMAIL_POLL_MODE", "poll_mode") or "unseen").strip().lower()
-        self._last_uid: int = 0
-        self._uid_state_file = self._uid_state_path()
-        self._load_last_uid()
-        self._seen_uids: set = set()
+        # Which mailboxes the poller reads: INBOX alone by default, plus whatever the operator names
+        # for a server-side rule that files channel mail out of the Inbox (see _parse_mailboxes).
+        self._mailboxes = _parse_mailboxes(setting("EMAIL_MAILBOXES", "mailboxes"))
+        # One high-water UID cursor per mailbox, each in its own state file: INBOX keeps the historic
+        # ``<address>.uid``, so an upgrade resumes exactly where the single-mailbox adapter left off.
+        self._last_uids: Dict[str, int] = {}
+        self._uid_state_files: Dict[str, Path] = {}
+        for mailbox in self._mailboxes:
+            self._uid_state_files[mailbox] = self._uid_state_path(mailbox)
+            self._last_uids[mailbox] = self._load_last_uid(mailbox)
+        # Seen UIDs are per mailbox: a UID is unique only WITHIN a mailbox, while the INBOX baseline
+        # holds every existing INBOX UID — one shared set would swallow a folder message whose UID
+        # happens to equal one of them. ``_seen_uids`` stays INBOX's set (the historic attribute).
+        self._seen_uids_by_mailbox: Dict[str, set] = {mailbox: set() for mailbox in self._mailboxes}
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
+        # Cross-mailbox duplicate suppression: a rule that files (rather than moves) leaves the same
+        # mail in INBOX AND its folder, and polling each would answer it twice. Only meaningful — and
+        # so only switched on — with more than one mailbox; INBOX alone keeps the historic behaviour.
+        self._dedupe_message_ids: bool = len(self._mailboxes) > 1
+        self._seen_message_ids: set = set()
+        self._seen_message_ids_max: int = 2000
         self._poll_task: Optional[asyncio.Task] = None
         self._last_fetch_failed, self._last_fetch_error = False, ""  # "checked, nothing new" vs "the check itself failed"
         # Sending identity. EMAIL_ADDRESS is the LOGIN (server username — Fastmail requires the
@@ -437,40 +478,95 @@ class EmailAdapter(BasePlatformAdapter):
         # back into ITS conversation instead of onto whatever that sender sent last.
         self._thread_threads: Dict[Tuple[str, str], Dict[str, str]] = {}
         logger.info("[Email] Adapter initialized for %s", self._address)
+        logger.info("[Email] Polling mailboxes: %s", ", ".join(self._mailboxes))
 
-    def _uid_state_path(self) -> Path:
-        """Where the high-water UID lives, so a restart resumes rather than replaying or skipping."""
+    @property
+    def _seen_uids(self) -> set:
+        """Seen UIDs of INBOX — the historic single-mailbox attribute (``_seen_uids_by_mailbox`` owns the rest)."""
+        return self._seen_uids_by_mailbox["INBOX"]
+
+    @_seen_uids.setter
+    def _seen_uids(self, uids: set) -> None:
+        self._seen_uids_by_mailbox["INBOX"] = uids
+
+    def _seen_uids_for(self, mailbox: str) -> set:
+        """The seen-UID set of *mailbox*: UIDs are unique within a mailbox, never across mailboxes."""
+        return self._seen_uids_by_mailbox.setdefault(mailbox, set())
+
+    def _snapshot_key(self, mailbox: str) -> str:
+        """Reconnect-snapshot key: the bare address for INBOX (the historic key), ``address:mailbox`` else."""
+        return self._address if _is_inbox(mailbox) else f"{self._address}:{mailbox}"
+
+    def _uid_state_path(self, mailbox: str = "INBOX") -> Path:
+        """Where a mailbox's high-water UID lives, so a restart resumes rather than replaying or skipping.
+
+        INBOX keeps the historic ``<address>.uid`` name — an upgrade must find its cursor exactly where
+        the single-mailbox adapter left it — and every additional mailbox appends its own sanitised name.
+        """
         home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", self._address or "mailbox")
+        if not _is_inbox(mailbox):
+            # Lowercased, so re-spelling the folder in the config cannot orphan the cursor and
+            # re-baseline the mailbox (losing whatever arrived in between).
+            safe = f"{safe}.{re.sub(r'[^A-Za-z0-9._-]', '_', mailbox.strip()).lower()}"
         return home / "email_state" / f"{safe}.uid"
 
-    def _load_last_uid(self) -> None:
+    def _load_last_uid(self, mailbox: str = "INBOX") -> int:
+        """Read a mailbox's high-water UID, so a restart resumes rather than replaying or skipping."""
+        state_file = self._uid_state_files[mailbox]
         try:
-            if self._uid_state_file.exists():
-                self._last_uid = int(self._uid_state_file.read_text().strip() or 0)
+            if state_file.exists():
+                return int(state_file.read_text().strip() or 0)
         except Exception as exc:  # a corrupt state file must not stop the mailbox from working
-            logger.debug("[Email] unreadable UID state %s: %s", self._uid_state_file, exc)
+            logger.debug("[Email] unreadable UID state %s: %s", state_file, exc)
+        return 0
 
-    def _save_last_uid(self, uid: int) -> None:
+    def _save_last_uid(self, mailbox: str, uid: int) -> None:
         """Best effort: a failed write costs one poll of accuracy, never a dispatch."""
+        state_file = self._uid_state_files[mailbox]
         try:
-            self._uid_state_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._uid_state_file.with_suffix(".uid.tmp")
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = state_file.with_suffix(".uid.tmp")
             tmp.write_text(f"{int(uid)}\n")
-            tmp.replace(self._uid_state_file)
+            tmp.replace(state_file)
         except Exception as exc:
             logger.debug("[Email] could not persist UID state: %s", exc)
 
-    def _trim_seen_uids(self) -> None:
+    def _trim_seen_uids(self, mailbox: str = "INBOX") -> None:
         """Keep only the highest half of UIDs once over the cap (UIDs are monotonic; UNSEEN prevents re-delivery)."""
-        if len(self._seen_uids) <= self._seen_uids_max:
+        seen = self._seen_uids_for(mailbox)
+        if len(seen) <= self._seen_uids_max:
             return
         try:
-            sorted_uids = sorted(self._seen_uids, key=lambda u: int(u))  # UIDs are bytes like b'1234'
-            self._seen_uids = set(sorted_uids[-(self._seen_uids_max // 2):])
-            logger.debug("[Email] Trimmed seen UIDs to %d entries", len(self._seen_uids))
+            sorted_uids = sorted(seen, key=lambda u: int(u))  # UIDs are bytes like b'1234'
+            self._seen_uids_by_mailbox[mailbox] = set(sorted_uids[-(self._seen_uids_max // 2):])
+            logger.debug("[Email] Trimmed seen UIDs to %d entries", len(self._seen_uids_by_mailbox[mailbox]))
         except (ValueError, TypeError):
-            self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
+            self._seen_uids_by_mailbox[mailbox] = set(list(seen)[-self._seen_uids_max // 2:])
+
+    def _trim_seen_message_ids(self) -> None:
+        """Keep the most recent half once over the cap (same bounded-memory spirit as _trim_seen_uids)."""
+        if len(self._seen_message_ids) <= self._seen_message_ids_max:
+            return
+        self._seen_message_ids = set(list(self._seen_message_ids)[-(self._seen_message_ids_max // 2):])
+        logger.debug("[Email] Trimmed seen Message-IDs to %d entries", len(self._seen_message_ids))
+
+    def _duplicate_message_id(self, message_id: Any) -> bool:
+        """True when this Message-ID was already collected — and remember it.
+
+        The one identifier a message keeps wherever it is filed, which is exactly the case that
+        matters: a server-side rule can have the same mail in INBOX AND its folder at once, and
+        polling both would answer it twice. Only reached when more than one mailbox is configured.
+        """
+        key = str(message_id or "").strip().lower()
+        if not key:
+            return False  # nothing to key on: a missing Message-ID is not evidence of a duplicate
+        if key in self._seen_message_ids:
+            logger.debug("[Email] Skipping duplicate Message-ID %s (already collected from another mailbox)", key)
+            return True
+        self._seen_message_ids.add(key)
+        self._trim_seen_message_ids()
+        return False
 
     def _connect_imap(self) -> imaplib.IMAP4:
         """Create an IMAP connection using implicit TLS, STARTTLS, or plaintext."""
@@ -502,6 +598,11 @@ class EmailAdapter(BasePlatformAdapter):
         finally:
             _close_imap(imap)
 
+    def _select_mailbox(self, imap: "imaplib.IMAP4", mailbox: str) -> None:
+        """Select *mailbox* on an open handle; INBOX needs no call — ``_inbox()`` already selected it."""
+        if not _is_inbox(mailbox):
+            imap.select(mailbox)
+
     def _connect_smtp(self) -> smtplib.SMTP:
         """SMTP connection with TLS established (callers go straight to ``login()``). An unreachable IPv6 address can
         hang until the socket timeout, so connection-level failures retry through an IPv4-only socket path (no global
@@ -521,22 +622,23 @@ class EmailAdapter(BasePlatformAdapter):
         return False
 
     def _probe_imap(self, is_reconnect: bool) -> bool:
-        """Connection test + seen-UID baseline. Sets a fatal error and returns False on failure."""
+        """Connection test + seen-UID baseline for every configured mailbox. Sets a fatal error and returns False on failure."""
         try:
             with self._inbox() as imap:
-                snapshot = self._seen_uids_snapshot.get(self._address)
-                if is_reconnect and snapshot is not None:
-                    # Same-process reconnect: restore the previous adapter's baseline so mail that
-                    # arrived during the outage stays eligible for the next poll.
-                    self._seen_uids = set(snapshot)
-                    passed = "[Email] IMAP reconnect test passed. Restored %d seen UIDs; messages received during the outage will be processed."
-                else:  # first connect (or no snapshot): mark all existing messages seen
-                    status, data = imap.uid("search", None, "ALL")
-                    self._seen_uids.update(data[0].split() if status == "OK" and data and data[0] else ())
-                    passed = "[Email] IMAP connection test passed. %d existing messages skipped."
-                self._trim_seen_uids()
-                logger.info(passed, len(self._seen_uids))
-            self._seen_uids_snapshot[self._address] = set(self._seen_uids)
+                # list(): a mailbox that cannot be baselined is dropped from the poll set below.
+                for mailbox in list(self._mailboxes):
+                    try:
+                        self._select_mailbox(imap, mailbox)  # INBOX is already selected by _inbox()
+                        self._baseline_mailbox(imap, mailbox, is_reconnect)
+                    except Exception as e:
+                        if _is_inbox(mailbox):
+                            raise  # the historic single-mailbox probe: its failure fails the connect
+                        # Polling a mailbox we could not baseline would replay its whole backlog as
+                        # prompts, so stop polling it (a reconnect re-probes it) and say so.
+                        self._mailboxes.remove(mailbox)
+                        logger.error("[Email] IMAP probe failed for mailbox %s, not polling it: %s", mailbox, e)
+            for mailbox in self._mailboxes:
+                self._seen_uids_snapshot[self._snapshot_key(mailbox)] = set(self._seen_uids_for(mailbox))
             return True
         except Exception as e:
             # Always set an explicit fatal code, else the gateway treats every failure as transient with zero
@@ -544,6 +646,21 @@ class EmailAdapter(BasePlatformAdapter):
             # AND transient NOs (Gmail "too many simultaneous connections"); loops surface via NEEDS_ATTENTION.
             return self._fail("[Email] IMAP connection failed: %s", e, "email_imap_connect_error",
                               f"IMAP connection to {self._imap_host}:{self._imap_port} failed: {e}", retryable=True)
+
+    def _baseline_mailbox(self, imap: "imaplib.IMAP4", mailbox: str, is_reconnect: bool) -> None:
+        """Take (or, on a same-process reconnect, restore) the seen-UID baseline of one SELECTed mailbox."""
+        snapshot = self._seen_uids_snapshot.get(self._snapshot_key(mailbox))
+        if is_reconnect and snapshot is not None:
+            # Same-process reconnect: restore the previous adapter's baseline so mail that
+            # arrived during the outage stays eligible for the next poll.
+            self._seen_uids_by_mailbox[mailbox] = set(snapshot)
+            passed = "[Email] IMAP reconnect test passed. Restored %d seen UIDs; messages received during the outage will be processed."
+        else:  # first connect (or no snapshot): mark all existing messages seen
+            status, data = imap.uid("search", None, "ALL")
+            self._seen_uids_for(mailbox).update(data[0].split() if status == "OK" and data and data[0] else ())
+            passed = "[Email] IMAP connection test passed. %d existing messages skipped."
+        self._trim_seen_uids(mailbox)
+        logger.info(passed, len(self._seen_uids_for(mailbox)))
 
     def _probe_smtp(self) -> bool:
         """SMTP connect + login test. Sets a fatal error and returns False on failure."""
@@ -614,69 +731,96 @@ class EmailAdapter(BasePlatformAdapter):
             await self._notify_fatal_error()
 
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
-        """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
-        results = []
+        """Fetch new messages from every configured mailbox. Runs in executor thread."""
+        results: List[Dict[str, Any]] = []
+        baselined: set = set()  # mailboxes that only set their first-run baseline: nothing was processed
         try:
             with self._inbox() as imap:
-                if self._poll_mode == "uid":
-                    if not self._last_uid:
-                        # First run: baseline at the newest UID so the operator's existing archive is
-                        # never replayed as prompts — everything from now on is new mail.
-                        status, data = imap.uid("search", None, "ALL")
-                        newest = max((int(u) for u in (data[0].split() if status == "OK" and data and data[0] else [])), default=0)
-                        self._last_uid = newest
-                        self._save_last_uid(newest)
-                        logger.info("[Email] UID poll baseline set to %s (nothing older is dispatched)", newest)
-                        return []
-                    # NB: IMAP's "UID n:*" always returns at least the newest message, so filter.
-                    status, data = imap.uid("search", None, f"UID {self._last_uid + 1}:*")
-                    candidates = [u for u in (data[0].split() if status == "OK" and data and data[0] else [])
-                                  if int(u) > self._last_uid]
-                else:
-                    status, data = imap.uid("search", None, "UNSEEN")
-                    candidates = (data[0].split() if status == "OK" and data and data[0] else [])
-                for uid in candidates:
-                    if uid in self._seen_uids:
-                        continue
-                    # BODY.PEEK[] — NOT plain RFC822: a non-PEEK fetch implicitly sets \\Seen, which
-                    # would mark the operator's unread mail read when the adapter shares their mailbox.
-                    status, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
-                    if status != "OK":
-                        continue  # transient per-UID refusal: leave unseen so the next poll retries
-                    # Mark seen once a response arrived (even malformed) so garbage is skipped once, not retried forever —
-                    # but NOT before the fetch: a connection failure must leave the rest of the batch eligible for the next poll.
-                    # IMAP fetch can return unexpected structures (e.g. a single bytes item instead of a
-                    # list of tuples). See #80032.
-                    self._seen_uids.add(uid)
-                    self._trim_seen_uids()
-                    if self._poll_mode == "uid":
-                        self._last_uid = max(self._last_uid, int(uid))
-                        self._save_last_uid(self._last_uid)
+                for mailbox in self._mailboxes:
                     try:
-                        raw_email = msg_data[0][1]
-                    except (IndexError, TypeError):
-                        logger.warning("[Email] Unexpected IMAP response structure for UID %s, skipping", uid)
-                        continue
-                    if not isinstance(raw_email, (bytes, bytearray)):
-                        logger.warning("[Email] Non-bytes IMAP payload for UID %s, skipping", uid)
-                        continue
-                    # One poison message (unparseable headers, pathological attachment, DNS hiccup) must not abort the batch or force a reconnect.
-                    try:
-                        # See #80032.
-                        parsed = self._parse_fetched_message(uid, raw_email)
-                    except Exception as parse_exc:
-                        logger.error("[Email] Failed to process message UID %s, skipping: %s", uid, parse_exc)
-                        continue
-                    if parsed is not None:
-                        results.append(parsed)
+                        self._select_mailbox(imap, mailbox)  # INBOX is already selected by _inbox()
+                        if not self._fetch_mailbox(imap, mailbox, results):
+                            baselined.add(mailbox)
+                    except Exception as e:
+                        if _is_inbox(mailbox):
+                            raise  # the historic single-mailbox path escalates exactly as before
+                        # A mailbox we cannot read (renamed, unsubscribed, server hiccup) must not take
+                        # the channel down with it: the others, INBOX included, keep polling.
+                        logger.error("[Email] IMAP poll failed for mailbox %s: %s", mailbox, e)
         except Exception as e:
             # _close_imap guarantees the socket dies even when logout() raises IMAP4.abort on a broken
             # connection (#79889).
             logger.error("[Email] IMAP fetch error: %s", e)
             self._last_fetch_failed, self._last_fetch_error = True, str(e)
         # Keep the reconnect snapshot current so a mid-outage adapter recreation does not re-dispatch messages already processed.
-        self._seen_uids_snapshot[self._address] = set(self._seen_uids)
+        for mailbox in self._mailboxes:
+            if mailbox not in baselined:  # a baseline-only mailbox processed nothing and keeps its connect-time snapshot
+                self._seen_uids_snapshot[self._snapshot_key(mailbox)] = set(self._seen_uids_for(mailbox))
         return results
+
+    def _fetch_mailbox(self, imap: "imaplib.IMAP4", mailbox: str, results: List[Dict[str, Any]]) -> bool:
+        """Fetch new mail from one SELECTed mailbox into *results*. Read-only: BODY.PEEK[] and no STORE/COPY/move.
+
+        Appends to the caller's list rather than returning its own, so a connection failure mid-batch
+        still hands back the messages already fetched (they are marked seen and would be lost otherwise).
+        Returns False when this was the mailbox's first uid-mode run and it only set its baseline.
+        """
+        last_uid = self._last_uids.get(mailbox, 0)
+        if self._poll_mode == "uid":
+            if not last_uid:
+                # First run for this mailbox: baseline at the newest UID so the operator's existing
+                # archive is never replayed as prompts — everything from now on is new mail.
+                status, data = imap.uid("search", None, "ALL")
+                newest = max((int(u) for u in (data[0].split() if status == "OK" and data and data[0] else [])), default=0)
+                self._last_uids[mailbox] = newest
+                self._save_last_uid(mailbox, newest)
+                logger.info("[Email] UID poll baseline set to %s (nothing older is dispatched)", newest)
+                return False  # baselined only: nothing was processed
+            # NB: IMAP's "UID n:*" always returns at least the newest message, so filter.
+            status, data = imap.uid("search", None, f"UID {last_uid + 1}:*")
+            candidates = [u for u in (data[0].split() if status == "OK" and data and data[0] else [])
+                          if int(u) > last_uid]
+        else:
+            status, data = imap.uid("search", None, "UNSEEN")
+            candidates = (data[0].split() if status == "OK" and data and data[0] else [])
+        for uid in candidates:
+            if uid in self._seen_uids_for(mailbox):
+                continue
+            # BODY.PEEK[] — NOT plain RFC822: a non-PEEK fetch implicitly sets \Seen, which
+            # would mark the operator's unread mail read when the adapter shares their mailbox.
+            status, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
+            if status != "OK":
+                continue  # transient per-UID refusal: leave unseen so the next poll retries
+            # Mark seen once a response arrived (even malformed) so garbage is skipped once, not retried forever —
+            # but NOT before the fetch: a connection failure must leave the rest of the batch eligible for the next poll.
+            # IMAP fetch can return unexpected structures (e.g. a single bytes item instead of a
+            # list of tuples). See #80032.
+            self._seen_uids_for(mailbox).add(uid)
+            self._trim_seen_uids(mailbox)
+            if self._poll_mode == "uid":
+                self._last_uids[mailbox] = max(self._last_uids.get(mailbox, 0), int(uid))
+                self._save_last_uid(mailbox, self._last_uids[mailbox])
+            try:
+                raw_email = msg_data[0][1]
+            except (IndexError, TypeError):
+                logger.warning("[Email] Unexpected IMAP response structure for UID %s, skipping", uid)
+                continue
+            if not isinstance(raw_email, (bytes, bytearray)):
+                logger.warning("[Email] Non-bytes IMAP payload for UID %s, skipping", uid)
+                continue
+            # One poison message (unparseable headers, pathological attachment, DNS hiccup) must not abort the batch or force a reconnect.
+            try:
+                # See #80032.
+                parsed = self._parse_fetched_message(uid, raw_email)
+            except Exception as parse_exc:
+                logger.error("[Email] Failed to process message UID %s, skipping: %s", uid, parse_exc)
+                continue
+            if parsed is None:
+                continue
+            if self._dedupe_message_ids and self._duplicate_message_id(parsed.get("message_id")):
+                continue
+            results.append(parsed)
+        return True
 
     def _parse_fetched_message(self, uid: bytes, raw_email: "bytes | bytearray") -> Optional[Dict[str, Any]]:
         """Parse one RFC822 payload into a dispatchable dict; ``None`` for automated senders. Raises on pathological input (caller logs + continues)."""
