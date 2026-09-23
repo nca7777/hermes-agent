@@ -4869,15 +4869,21 @@ def _stop_cron_provider(provider) -> None:
 # Cron thread blocks on future.result(timeout=60) (cron/scheduler.py::_deliver_result) + margin.
 _CRON_SHUTDOWN_DRAIN_TIMEOUT = 65.0
 
+# A startup path that ABORTS before serving stops the early-started ticker with a short bound: the
+# process is on its way out (daemon thread, abandoned with it), and the successor must not be held up.
+_STARTUP_ABORT_CRON_DRAIN_TIMEOUT = 5.0
+
 # Housekeeping's channel-directory refresh blocks on fut.result(timeout=30); cover that + margin.
 _HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT = 35.0
 
 
 async def _await_thread_exit(
-    thread: Optional[threading.Thread], timeout: float, poll: float = 0.1) -> bool:
+    thread: Any, timeout: float, poll: float = 0.1) -> bool:
     """Wait for a daemon thread to exit WITHOUT blocking the event loop; True if it exited in time.
-    A synchronous ``join()`` freezes the loop — fatal for the cron ticker, whose in-flight delivery is a
-    coroutine on *this* loop: it could never run, so the join timed out and the message dropped.
+    ``thread`` is anything thread-shaped (``threading.Thread`` or ``cron.scheduler_thread.
+    SupervisedTickerThread``), i.e. it exposes ``is_alive()``. A synchronous ``join()`` freezes the
+    loop — fatal for the cron ticker, whose in-flight delivery is a coroutine on *this* loop: it could
+    never run, so the join timed out and the message dropped.
 
     See #58818.
     """
@@ -5584,9 +5590,23 @@ async def _start_gateway_start_control_socket(runner):
     return _control_server
 
 
-def _start_gateway_start_cron_and_housekeeping(runner):
-    """Start the cron scheduler thread + gateway housekeeping thread; returns
-    ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
+def _start_gateway_cron_ticker(runner):
+    """Start the cron scheduler thread; returns ``(cron_stop, cron_provider, cron_thread)``.
+
+    Started BEFORE MCP discovery and adapter/plugin bring-up — see ``start_gateway``. This one ticker
+    owns EVERY profile's store, and ``runner.start()`` takes minutes on a many-home host, so the
+    ordering is what keeps due jobs (and their catch-up dispatches) firing while adapters converge.
+
+    DELIVERY SEMANTICS landed by running this early: ``adapters`` and ``profile_adapters`` are handed
+    over as the LIVE dicts (``runner.adapters`` / ``runner._profile_adapters``) that bring-up mutates
+    in place as each adapter connects (both are plain dicts, never rebound). So a job that comes due
+    mid-bring-up FIRES. Its output delivers through whichever adapters are already live; with none
+    live yet the delivery falls back to its standalone HTTP lane (``cron/scheduler_delivery.py::
+    _deliver_standalone``), which usually succeeds — and when both lanes fail, the delivery fails
+    CLOSED: the occurrence is consumed and ``last_delivery_error`` is recorded on the job (visible in
+    ``hermes cron status``) instead of the fire being skipped, and the next occurrence fires normally.
+    What is never traded away is the FIRE itself: jobs are not silently un-fired by a restart.
+    """
     # The event loop is passed so cron delivery can use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
@@ -5618,7 +5638,9 @@ def _start_gateway_start_cron_and_housekeeping(runner):
         # runner.adapters belongs to the LAUNCH profile (``default``, or the ``--profile``
         # name); naming it keeps the ticker from routing a secondary's cron through that bot
         # and lets a named multiplexer's own jobs reuse its live adapters.
-        cron_start_kwargs["default_profile"] = runner._primary_profile_name
+        # ``getattr``: startup paths reach this with a stubbed runner (tests) that has no
+        # ``_primary_profile_name``; the launch profile is the only sane default there.
+        cron_start_kwargs["default_profile"] = getattr(runner, "_primary_profile_name", None) or "default"
         logger.info(
             "Cron scheduler will tick %d profile(s): %s", len(cron_profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in cron_profile_homes])
@@ -5632,6 +5654,18 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     cron_thread = SupervisedTickerThread(
         cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, stop_event=cron_stop)
     cron_thread.start()
+    return cron_stop, cron_provider, cron_thread
+
+
+def _start_gateway_housekeeping_thread(runner, cron_stop, cron_provider, cron_thread):
+    """Start the gateway housekeeping thread; returns it.
+
+    Runs AFTER ``runner.start()`` by design: its chores want live adapters (restart-safe delivery
+    drains, channel directory) and the api_server tell below is only truthful once bring-up has
+    populated ``runner.adapters`` — judging it at ticker-start time would warn wrongly for every
+    external-provider gateway, whose adapters are still empty that early.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
 
     # External providers fire over loopback HTTP to THIS process's api_server; if it never came up (usually
     # API_SERVER_KEY missing) every fire fails while manual runs work — misread as a job bug. Say it ONCE.
@@ -5658,6 +5692,19 @@ def _start_gateway_start_cron_and_housekeeping(runner):
                 "cron_provider": cron_provider, "runner": runner, "cron_thread": cron_thread},
         daemon=True, name="gateway-housekeeping")
     housekeeping_thread.start()
+    return housekeeping_thread
+
+
+def _start_gateway_start_cron_and_housekeeping(runner):
+    """Cron ticker + housekeeping in one call, both post-bring-up; 4-tuple shape kept for callers.
+
+    Production boots the ticker EARLY via ``_start_gateway_cron_ticker`` (see ``start_gateway``) and
+    only the housekeeping thread after bring-up. This wrapper is for callers/tests that want the
+    post-bring-up ordering for both threads at once.
+    """
+    cron_stop, cron_provider, cron_thread = _start_gateway_cron_ticker(runner)
+    housekeeping_thread = _start_gateway_housekeeping_thread(
+        runner, cron_stop, cron_provider, cron_thread)
     return cron_stop, cron_provider, cron_thread, housekeeping_thread
 
 
@@ -5820,6 +5867,26 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
     _ensure_windows_gateway_venv_imports()
 
+    # ── Cron BEFORE bring-up (#t_661d3766) ───────────────────────────────────────────────────────────
+    # Everything between here and READY used to run first: MCP discovery (blocks up to 120s) and then
+    # ``runner.start()``'s adapter connect PLUS per-profile plugin bring-up (~5s/home — measured 13
+    # minutes across 97 homes). Because the ticker started LAST, no job on the host fired from the
+    # predecessor's final tick until bring-up finished: every gateway restart blinded the whole fleet
+    # for 14-18 minutes, including the 5-minute mem0 watchdog (the 502 alarm path) and the */20 spend
+    # guard. Start the ticker here instead, so due jobs and their catch-up dispatches fire while
+    # adapters converge. Delivery semantics for that window: see ``_start_gateway_cron_ticker``.
+    cron_stop, cron_provider, cron_thread = _start_gateway_cron_ticker(runner)
+
+    async def _stop_startup_cron(exit_reason: str) -> None:
+        """Tear the early-started ticker down on a startup path that never reaches serving."""
+        cron_stop.set()
+        _stop_cron_provider(cron_provider)
+        if not await _await_thread_exit(cron_thread, timeout=_STARTUP_ABORT_CRON_DRAIN_TIMEOUT):
+            logger.warning(
+                "Cron ticker did not exit within %.0fs of an aborted startup (%s); its daemon "
+                "thread is abandoned with the process.", _STARTUP_ABORT_CRON_DRAIN_TIMEOUT,
+                exit_reason)
+
     # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
     try:
         # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
@@ -5833,9 +5900,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     try:
         success = await runner.start()
     except BaseException:
+        await _stop_startup_cron("runner.start() raised")
         _shutdown_gateway_health_export(runner)
         raise
     if not success:
+        await _stop_startup_cron("adapter bring-up failed")
         _shutdown_gateway_health_export(runner)
         return False
 
@@ -5849,6 +5918,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     _best_effort(_recover_pending)
     if runner.should_exit_cleanly:
+        await _stop_startup_cron("clean early exit")
         _shutdown_gateway_health_export(runner)
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
@@ -5857,7 +5927,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             raise SystemExit(runner.exit_code)
         return True
     if not runner._running:
-        # Startup aborted by restart/shutdown before running mode; preserve that path without starting cron.
+        # Startup aborted by restart/shutdown before running mode; preserve that path without serving.
+        await _stop_startup_cron("startup aborted before running mode")
         try:
             await runner.wait_for_shutdown()
             try:
@@ -5868,8 +5939,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         finally:
             _shutdown_gateway_health_export(runner)
 
-    cron_stop, cron_provider, cron_thread, housekeeping_thread = (
-        _start_gateway_start_cron_and_housekeeping(runner))
+    # Housekeeping only: its chores (and the api_server tell) need adapters that are now live. The
+    # ticker itself has been running since before bring-up.
+    housekeeping_thread = _start_gateway_housekeeping_thread(
+        runner, cron_stop, cron_provider, cron_thread)
 
     # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
     runner._start_systemd_watchdog()

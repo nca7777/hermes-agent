@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -167,6 +168,50 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     )
 
 
+class _RecordingCronTicker:
+    """Stand-in for the early-started cron ticker thread (``_start_gateway_cron_ticker``)."""
+
+    def __init__(self, stop_event):
+        self.stop_event = stop_event
+        self.started = True
+
+    def is_alive(self):
+        return self.started and not self.stop_event.is_set()
+
+
+def _record_early_cron(monkeypatch):
+    """Record the EARLY cron ticker's start and its teardown on an aborted startup.
+
+    ``start_gateway`` starts the cron ticker before adapter/plugin bring-up (t_661d3766), so the
+    invariant on a path that aborts before serving is "started, then stopped — never leaked", NOT
+    "never started". The old guard here patched ``gateway.run._start_cron_ticker``, a symbol the
+    startup path no longer calls, so it could never have caught a leak either way.
+    """
+    state = {"started": 0, "stopped_providers": 0, "ticker": None}
+
+    def fake_start(runner):
+        ticker = _RecordingCronTicker(threading.Event())
+        state["started"] += 1
+        state["ticker"] = ticker
+        return ticker.stop_event, object(), ticker
+
+    def record_provider_stop(provider):
+        state["stopped_providers"] += 1
+
+    monkeypatch.setattr(gateway_run, "_start_gateway_cron_ticker", fake_start)
+    monkeypatch.setattr(gateway_run, "_stop_cron_provider", record_provider_stop)
+    return state
+
+
+def _assert_early_cron_torn_down(state):
+    assert state["started"] == 1, "the early cron ticker must be started before bring-up"
+    assert state["ticker"].stop_event.is_set(), (
+        "an aborted startup must stop the early-started cron ticker")
+    assert state["ticker"].is_alive() is False, (
+        "the early cron ticker must not outlive an aborted startup")
+    assert state["stopped_providers"] == 1, "the cron provider must be stopped on an aborted startup"
+
+
 def _patch_aborted_startup(monkeypatch, runner_cls):
     """Run start_gateway() against a runner that aborts before running mode."""
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -180,9 +225,9 @@ def _patch_aborted_startup(monkeypatch, runner_cls):
 
 
 @pytest.mark.asyncio
-async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path, monkeypatch):
+async def test_start_gateway_stops_the_early_cron_ticker_after_aborted_startup(tmp_path, monkeypatch):
+    """The ticker starts before bring-up now, so an aborted startup must STOP it, not never start it."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    cron_started = False
     export_shutdown_calls = 0
 
     class ExportRuntime:
@@ -207,19 +252,15 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
         async def wait_for_shutdown(self):
             return None
 
-    def fail_if_cron_starts(*args, **kwargs):
-        nonlocal cron_started
-        cron_started = True
-
     _patch_aborted_startup(monkeypatch, AbortedStartupRunner)
-    monkeypatch.setattr("gateway.run._start_cron_ticker", fail_if_cron_starts)
+    cron = _record_early_cron(monkeypatch)
     monkeypatch.setattr("tools.mcp_tool_lifecycle.shutdown_mcp_servers", lambda: None)
 
     with pytest.raises(SystemExit) as exc:
         await gateway_run.start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
 
     assert exc.value.code == GATEWAY_SERVICE_RESTART_EXIT_CODE
-    assert cron_started is False
+    _assert_early_cron_torn_down(cron)
     assert export_shutdown_calls == 1
 
 
@@ -229,7 +270,6 @@ async def test_start_gateway_preserves_service_restart_fallback_after_aborted_st
 ):
     """A legacy service restart without an explicit exit code still exits with EX_TEMPFAIL."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    cron_started = False
 
     class AbortedStartupRunner:
         def __init__(self, config):
@@ -249,12 +289,8 @@ async def test_start_gateway_preserves_service_restart_fallback_after_aborted_st
         async def wait_for_shutdown(self):
             return None
 
-    def fail_if_cron_starts(*args, **kwargs):
-        nonlocal cron_started
-        cron_started = True
-
     _patch_aborted_startup(monkeypatch, AbortedStartupRunner)
-    monkeypatch.setattr("gateway.run._start_cron_ticker", fail_if_cron_starts)
+    cron = _record_early_cron(monkeypatch)
     monkeypatch.setattr("tools.mcp_tool_lifecycle.shutdown_mcp_servers", lambda: None)
 
     with pytest.raises(SystemExit) as exc:
@@ -263,7 +299,7 @@ async def test_start_gateway_preserves_service_restart_fallback_after_aborted_st
         )
 
     assert exc.value.code == GATEWAY_SERVICE_RESTART_EXIT_CODE
-    assert cron_started is False
+    _assert_early_cron_torn_down(cron)
 
 
 @pytest.mark.asyncio
@@ -278,7 +314,6 @@ async def test_start_gateway_classifies_startup_signal_exit(
     """A startup SIGTERM is restartable unless a planned-stop marker classified it as intentional."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     signal_state = None
-    cron_started = False
 
     class AbortedStartupRunner:
         def __init__(self, config):
@@ -305,15 +340,11 @@ async def test_start_gateway_classifies_startup_signal_exit(
         signal_state = state
         return lambda received_signal=None: None
 
-    def fail_if_cron_starts(*args, **kwargs):
-        nonlocal cron_started
-        cron_started = True
-
     _patch_aborted_startup(monkeypatch, AbortedStartupRunner)
+    cron = _record_early_cron(monkeypatch)
     monkeypatch.setattr(
         "gateway.run._start_gateway_make_shutdown_signal_handler", capture_signal_state
     )
-    monkeypatch.setattr("gateway.run._start_cron_ticker", fail_if_cron_starts)
     monkeypatch.setattr("tools.mcp_tool_lifecycle.shutdown_mcp_servers", lambda: None)
 
     result = await gateway_run.start_gateway(
@@ -321,7 +352,7 @@ async def test_start_gateway_classifies_startup_signal_exit(
     )
 
     assert result is expected_success
-    assert cron_started is False
+    _assert_early_cron_torn_down(cron)
 
 
 @pytest.mark.asyncio
