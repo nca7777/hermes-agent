@@ -70,6 +70,63 @@ def test_apply_fallback_chain_skips_while_cooldown_holds_fallback():
     assert agent._fallback_activated is True
 
 
+def test_apply_fallback_chain_adopts_a_chain_removed_under_a_live_activation(caplog):
+    """A config edit that REMOVES the chain beats a cooldown armed for that chain.
+
+    The pause guard empties ``fallback_providers`` while the OpenCode Go cap window is engaged.
+    Before this, an agent that had already activated the metered Fireworks fallback ignored the
+    edit for its whole cooldown — up to days when the cooldown came from the provider's own
+    ``reset_at`` — so it kept paying with ``fallback_providers: []`` on disk.
+    """
+    import logging
+
+    from gateway.run import GatewayRunner
+
+    live = [{"provider": "fireworks", "model": "accounts/fireworks/models/deepseek-v4p1-flash"}]
+    agent = SimpleNamespace(
+        _fallback_chain=live,
+        _fallback_model=live[0],
+        _fallback_index=1,
+        _fallback_activated=True,
+        provider="fireworks",
+        _rate_limited_until=time.monotonic() + 93 * 3600,   # provider-reset-sourced: days
+        _rate_limit_backoff_count=4,
+    )
+    with caplog.at_level(logging.INFO):
+        GatewayRunner._apply_fallback_chain_to_agent(agent, [])
+
+    assert agent._fallback_chain == []
+    assert agent._fallback_model is None
+    assert agent._rate_limited_until == 0
+    assert agent._rate_limit_backoff_count == 0
+    # Activation flag stays: restore_primary_runtime owns the return trip and clears it itself.
+    # Clearing it here would hit that function's own early return and strand the session on the
+    # metered provider with an empty chain.
+    assert agent._fallback_activated is True
+    assert "clearing the cooldown so the session returns to the primary" in caplog.text
+
+
+def test_apply_fallback_chain_keeps_chain_when_config_is_untouched():
+    """No regression to #60955/#95066: a configured chain still does not clobber an activation."""
+    from gateway.run import GatewayRunner
+
+    live = [{"provider": "fireworks", "model": "accounts/fireworks/models/deepseek-v4p1-flash"}]
+    agent = SimpleNamespace(
+        _fallback_chain=["old"],
+        _fallback_model="old",
+        _fallback_index=0,
+        _fallback_activated=True,
+        provider="fireworks",
+        _rate_limited_until=time.monotonic() + 93 * 3600,
+        _rate_limit_backoff_count=4,
+    )
+    GatewayRunner._apply_fallback_chain_to_agent(agent, live)
+
+    assert agent._fallback_chain == ["old"]
+    assert agent._rate_limited_until > 0      # the cooldown is untouched on this path
+    assert agent._rate_limit_backoff_count == 4
+
+
 
 
 def test_load_fallback_model_static_unchanged_contract(tmp_path, monkeypatch):

@@ -142,6 +142,26 @@ function rawErrorFor(kind: string, ev: CompletionEvent): string {
   return kind === 'gave_up' ? trimmed(ev.payload?.error) : ''
 }
 
+/** A `timed_out` event records one of two unrelated failures, and the toast must name the one it
+ *  has: a worker stopped at its per-task runtime cap (remedy: more seconds) or a worker that ran
+ *  out of ITERATIONS (remedy: a smaller or checkpointed card). Mirrors the cause the Python
+ *  emitters stamp (hermes_cli/kanban_event_wording.py); an event written before that stamp is read
+ *  from the emitter's own budget fields or its own error sentence, and an event with none of those
+ *  is left as the plain timeout title rather than guessed at. */
+function timedOutTitleKey(ev: CompletionEvent): string {
+  const payload = ev.payload ?? {}
+  const declared = typeof payload.cause === 'string' ? payload.cause : ''
+  const budget = payload.budget_max
+  const error = typeof payload.error === 'string' ? payload.error : ''
+  const hasBudget =
+    declared === 'iteration_budget' ||
+    (typeof budget === 'number' && Number.isFinite(budget)) ||
+    (typeof budget === 'string' && budget.trim() !== '' && Number.isFinite(Number(budget))) ||
+    /iteration\s+budget\s+exhausted/i.test(error)
+
+  return hasBudget ? 'notify.iterationBudgetTitle' : 'notify.timedOutTitle'
+}
+
 function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
   const taskId = (ev.task_id ?? '').trim()
   const body = bodyFor(kind, ev)
@@ -161,7 +181,7 @@ function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, e
         : ''
 
   const detail = [taskId, artifactText, rawErrorFor(kind, ev)].filter(Boolean).join(' · ')
-  const title = t(spec.titleKey)
+  const title = t(kind === 'timed_out' ? timedOutTitleKey(ev) : spec.titleKey)
   const message = body || taskId || title
   host.notify({
     kind: spec.toast,

@@ -1282,37 +1282,25 @@ def restore_primary_runtime(agent) -> bool:
         key = resolve_runtime_pool_key(primary_provider, primary_runtime_base_url)
         loaded = load_pool(key) if key else None
         return loaded if loaded is not None and _matches_primary(loaded) else None
-    if not getattr(agent, "_fallback_chain", None):
-        # No chain left to fall back to: an operator/config edit removed ``fallback_providers`` out
-        # from under a live activation (see GatewayRunner._apply_fallback_chain_to_agent). Both
-        # gates below exist to keep the session USABLE on the fallback until the primary's reset
-        # elapses — with no chain that can only keep billing a metered fallback provider the
-        # operator has explicitly removed, and with nothing to alternate back to the double cache
-        # invalidation they prevent cannot happen. Return to the primary now; a primary that is
-        # genuinely still capped re-arms its own cooldown through the normal error path.
+    blocked, prefetched_pool, prefetched = _primary_reset_gate_blocks(
+        agent, rt, primary_provider, primary_runtime_base_url, _matches_primary, _load_primary_pool
+    )
+    if blocked:
+        return False
+    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+        # A cooldown armed from a provider-declared reset belongs to the CREDENTIAL that returned
+        # the 429 (subscription windows report days out), while the slot holding it is
+        # session-wide. Honouring it blind therefore strands a long-lived session on the paid
+        # fallback for the whole window even after a healthy credential of the same provider
+        # became usable — a new session would have picked it through ``select()``. Ask the pool
+        # and clear the stale stamp only when it has somewhere to go; a pool whose every entry is
+        # still benched keeps the cooldown.
+        if not _primary_pool_serves_now(
+            agent, primary_model, _matches_primary, _load_primary_pool, prefetched_pool
+        ):
+            return False  # primary still in rate-limit cooldown, stay on fallback
         agent._rate_limited_until = 0
         agent._rate_limit_backoff_count = 0
-        blocked, prefetched_pool, prefetched = False, None, False
-    else:
-        blocked, prefetched_pool, prefetched = _primary_reset_gate_blocks(
-            agent, rt, primary_provider, primary_runtime_base_url, _matches_primary, _load_primary_pool
-        )
-        if blocked:
-            return False
-        if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
-            # A cooldown armed from a provider-declared reset belongs to the CREDENTIAL that returned
-            # the 429 (subscription windows report days out), while the slot holding it is
-            # session-wide. Honouring it blind therefore strands a long-lived session on the paid
-            # fallback for the whole window even after a healthy credential of the same provider
-            # became usable — a new session would have picked it through ``select()``. Ask the pool
-            # and clear the stale stamp only when it has somewhere to go; a pool whose every entry is
-            # still benched keeps the cooldown.
-            if not _primary_pool_serves_now(
-                agent, primary_model, _matches_primary, _load_primary_pool, prefetched_pool
-            ):
-                return False  # primary still in rate-limit cooldown, stay on fallback
-            agent._rate_limited_until = 0
-            agent._rate_limit_backoff_count = 0
     agent._restore_wait_logged = False
     fallback_route = getattr(agent, "_provider_fallback_route", None)
     if not (isinstance(fallback_route, (list, tuple)) and len(fallback_route) == 2):

@@ -291,6 +291,43 @@ def _is_supervised_gateway_process() -> bool:
         return False
 
 
+def _inside_systemd_unit_cgroup() -> bool:
+    """True when this process lives inside a systemd unit cgroup (``*.service``/``*.scope``).
+
+    ``INVOCATION_ID`` is set only on the process systemd exec'd; a child whose
+    environment is rebuilt loses it while still living inside the unit's cgroup
+    (``tools/code_execution_env.py::_scrub_child_env`` strips it for the
+    ``execute_code`` kernel). Treating its absence as "not under systemd" makes
+    such a dispatcher spawn long-lived children — Kanban workers — straight into
+    the unit's cgroup, where ``KillMode=control-group`` kills them on the next
+    restart. The cgroup is the ground truth; the env var is only a hint.
+    """
+    if not _IS_LINUX:
+        return False
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    for line in text.splitlines():
+        parts = line.strip().split("::", 1)
+        if len(parts) != 2:
+            continue
+        path = parts[1]
+        unit = path.rsplit("/", 1)[-1]
+        if not (unit.endswith(".service") or unit.endswith(".scope")):
+            continue
+        # Require a *user-manager* instance (``user@<uid>.service``): that is the
+        # session we could scope into. A container's own cgroup
+        # (``/system.slice/docker-<id>.scope``) also ends in ``.scope`` but has no
+        # user bus, and claiming it would turn today's silent in-process spawn
+        # into a hard RestartSafeScopeUnavailable for ``require_restart_safe_scope``
+        # children (cron) in a containerised install.
+        if "user@" in path:
+            return True
+    return False
+
+
 def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation with its own
     memory accounting, so an OOM in the worker cannot kill the gateway cgroup.
@@ -404,7 +441,7 @@ def restart_safe_gateway_child_argv(
     """
     if not _IS_LINUX:
         return GatewayChildDispatch("in_process", command)
-    if not os.environ.get("INVOCATION_ID"):
+    if not os.environ.get("INVOCATION_ID") and not _inside_systemd_unit_cgroup():
         return GatewayChildDispatch("in_process", command)
     supervised_gateway = _is_supervised_gateway_process()
     if not supervised_gateway and not outlives_parent:

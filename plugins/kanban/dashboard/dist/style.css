@@ -103,7 +103,7 @@
   padding: 0.25rem 0.25rem 0.35rem;
   font-weight: 600;
   font-size: 0.85rem;
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
 }
 
 .hermes-kanban-column-label {
@@ -122,7 +122,7 @@
   appearance: none;
   background: transparent;
   border: 1px solid var(--color-border);
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
   border-radius: var(--radius-sm, 0.25rem);
   width: 22px;
   height: 22px;
@@ -131,7 +131,7 @@
   cursor: pointer;
 }
 .hermes-kanban-column-add:hover {
-  background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
+  background: color-mix(in srgb, var(--midground, currentColor) 8%, transparent);
 }
 
 .hermes-kanban-column-sub {
@@ -186,7 +186,7 @@
   font-size: 0.62rem;
   padding: 0.05rem 0.35rem;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
+  background: color-mix(in srgb, var(--midground, currentColor) 8%, transparent);
   border: 1px solid color-mix(in srgb, var(--color-border) 80%, transparent);
   color: var(--color-muted-foreground);
   letter-spacing: 0.02em;
@@ -194,7 +194,7 @@
 .hermes-kanban-progress--full {
   background: color-mix(in srgb, #3fb97d 22%, transparent);
   border-color: color-mix(in srgb, #3fb97d 45%, transparent);
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
 }
 
 /* ---- Lanes (per-profile sub-grouping inside Running) ---------------- */
@@ -270,7 +270,7 @@
   font-size: 0.85rem;
   font-weight: 500;
   line-height: 1.3;
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
   word-break: break-word;
 }
 
@@ -284,7 +284,7 @@
   font-size: 0.6rem !important;
   padding: 0.05rem 0.3rem !important;
   background: color-mix(in srgb, var(--color-ring) 18%, transparent);
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
   border: 1px solid color-mix(in srgb, var(--color-ring) 40%, transparent);
 }
 
@@ -312,12 +312,12 @@
   padding: 0.05rem 0.3rem !important;
   background: color-mix(in srgb, var(--color-warning, #d4b348) 16%, transparent);
   border-color: color-mix(in srgb, var(--color-warning, #d4b348) 45%, var(--color-border));
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
 }
 
 .hermes-kanban-assignee {
   font-weight: 500;
-  color: color-mix(in srgb, var(--color-foreground) 80%, var(--color-muted-foreground));
+  color: color-mix(in srgb, var(--midground, currentColor) 80%, var(--color-muted-foreground));
 }
 .hermes-kanban-unassigned {
   font-style: italic;
@@ -398,7 +398,7 @@
   cursor: pointer;
   padding: 0 0.25rem;
 }
-.hermes-kanban-drawer-close:hover { color: var(--color-foreground); }
+.hermes-kanban-drawer-close:hover { color: var(--midground, currentColor); }
 
 /* Attachment download trigger — styled as a link, rendered as a <button>
    so the click handler can fetch with the session token (#35338). */
@@ -445,7 +445,7 @@
   flex-direction: column;
   gap: 0.15rem;
   padding: 0.5rem 0.6rem;
-  background: color-mix(in srgb, var(--color-foreground) 4%, transparent);
+  background: color-mix(in srgb, var(--midground, currentColor) 4%, transparent);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm, 0.25rem);
 }
@@ -460,7 +460,7 @@
   color: var(--color-muted-foreground);
 }
 .hermes-kanban-meta-value {
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
   word-break: break-word;
 }
 
@@ -509,7 +509,7 @@
    * themes (tested on default teal and NERV orange). */
   border-color: var(--color-ring);
   background: color-mix(in srgb, var(--color-ring) 32%, transparent);
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
   font-weight: 600;
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-ring) 40%, transparent);
 }
@@ -532,13 +532,13 @@
   padding: 0.5rem 0.6rem;
   white-space: pre-wrap;
   word-break: break-word;
-  background: color-mix(in srgb, var(--color-foreground) 4%, transparent);
+  background: color-mix(in srgb, var(--midground, currentColor) 4%, transparent);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm, 0.25rem);
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 0.8rem;
   line-height: 1.5;
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
 }
 
 .hermes-kanban-comment {
@@ -556,7 +556,7 @@
 }
 .hermes-kanban-comment-author {
   font-weight: 600;
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
 }
 .hermes-kanban-comment-ago {
   color: var(--color-muted-foreground);
@@ -570,7 +570,7 @@
   font-family: var(--font-mono, ui-monospace, monospace);
 }
 .hermes-kanban-event-kind {
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
   min-width: 6rem;
 }
 .hermes-kanban-event-payload {
@@ -661,7 +661,7 @@
 }
 .hermes-kanban-bulk > button:hover:not(:disabled),
 .hermes-kanban-bulk-reassign > button:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
+  background: color-mix(in srgb, var(--midground, currentColor) 8%, transparent);
 }
 .hermes-kanban-bulk-reassign {
   display: flex;
@@ -701,12 +701,12 @@
   align-items: center;
   gap: 0.15rem;
   padding: 0.1rem 0.35rem;
-  background: color-mix(in srgb, var(--color-foreground) 6%, transparent);
+  background: color-mix(in srgb, var(--midground, currentColor) 6%, transparent);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm, 0.25rem);
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 0.68rem;
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
 }
 .hermes-kanban-dep-chip-x {
   appearance: none;
@@ -727,7 +727,7 @@
   border-bottom: 1px dotted color-mix(in srgb, var(--color-border) 80%, transparent);
 }
 .hermes-kanban-editable:hover {
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
   border-bottom-color: var(--color-ring);
 }
 
@@ -770,7 +770,7 @@
   width: 100%;
   min-height: 8rem;
   background: var(--color-card);
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm, 0.25rem);
   padding: 0.5rem 0.6rem;
@@ -790,7 +790,7 @@
 .hermes-kanban-md {
   font-size: 0.85rem;
   line-height: 1.6;
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
 }
 .hermes-kanban-md p  { margin: 0.25rem 0; }
 .hermes-kanban-md h1,
@@ -872,7 +872,7 @@
   border-radius: var(--radius);
   font-size: 0.85rem;
   font-weight: 600;
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
   pointer-events: none;
   opacity: 0.95;
@@ -912,7 +912,7 @@
   border-left: 2px solid var(--color-border);
   padding: 0.35rem 0.5rem;
   margin-bottom: 0.4rem;
-  background: color-mix(in srgb, var(--color-foreground) 3%, transparent);
+  background: color-mix(in srgb, var(--midground, currentColor) 3%, transparent);
   border-radius: var(--radius-sm, 0.25rem);
 }
 .hermes-kanban-run--active  { border-left-color: #3fb97d; }
@@ -938,7 +938,7 @@
   font-family: var(--font-mono, ui-monospace, monospace);
   font-weight: 600;
   letter-spacing: 0.05em;
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
 }
 .hermes-kanban-run-profile {
   color: var(--color-muted-foreground);
@@ -955,7 +955,7 @@
   font-size: 0.82rem;
   line-height: 1.5;
   padding: 0.2rem 0 0;
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
 }
 .hermes-kanban-run-error {
   font-size: 0.7rem;
@@ -1055,7 +1055,7 @@
 }
 .hermes-kanban-docs-link:hover,
 .hermes-kanban-docs-link:focus-visible {
-  color: var(--color-foreground, #e7e7ee);
+  color: var(--midground, #e7e7ee);
   background: var(--color-card, rgba(255, 255, 255, 0.08));
   border-color: var(--color-border, rgba(160, 160, 190, 0.45));
   outline: none;
@@ -1072,7 +1072,7 @@
 }
 .hermes-kanban-dialog {
   background: var(--color-card, #121421);
-  color: var(--color-foreground);
+  color: var(--midground, currentColor);
   border: 1px solid var(--color-border, rgba(120, 120, 140, 0.25));
   border-radius: 0.5rem;
   padding: 1.1rem 1.2rem 1rem;
@@ -1439,7 +1439,7 @@
 }
 .hermes-kanban-diag-detail {
   font-size: 0.8125rem;
-  color: var(--color-foreground, #ccc);
+  color: var(--midground, #ccc);
   line-height: 1.4;
 }
 .hermes-kanban-diag-data {

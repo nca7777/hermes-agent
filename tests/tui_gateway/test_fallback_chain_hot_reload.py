@@ -76,8 +76,22 @@ def test_torn_config_keeps_the_last_known_good_chain_but_removal_still_applies(m
     assert agent._fallback_chain == []
     assert agent._fallback_model is None
 
-    # While a cooldown holds the agent on an activated fallback, the sync leaves the chain alone.
+    # While a cooldown holds the agent on an activated fallback, a chain that is STILL CONFIGURED
+    # is left alone: the sync must not clobber a live activation with an unrelated edit.
     agent._fallback_chain, agent._fallback_activated = list(FALLBACK), True
     agent._rate_limited_until = time.monotonic() + 600
-    _admit_turn(monkeypatch, tmp_path, session, "model:\n  provider: openai\n")
+    _admit_turn(monkeypatch, tmp_path, session,
+                "fallback_providers:\n  - provider: xai-oauth\n    model: grok-4.6\n")
     assert agent._fallback_chain == FALLBACK
+
+    # But a config edit that REMOVES it wins over the cooldown. Before, an activated session ignored
+    # the removal for the whole cooldown — up to days when it came from the provider's own
+    # ``reset_at`` — so the pause guard's engage (fallback_providers: []) left it billing the
+    # metered fallback anyway.
+    agent._rate_limited_until = time.monotonic() + 600
+    _admit_turn(monkeypatch, tmp_path, session, "model:\n  provider: openai\n")
+    assert agent._fallback_chain == []
+    assert agent._fallback_model is None
+    assert agent._rate_limited_until == 0
+    # Activation stays: restore_primary_runtime owns the return trip and clears it itself.
+    assert agent._fallback_activated is True

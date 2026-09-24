@@ -6,7 +6,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from contextlib import closing, suppress
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,21 @@ _SYNC_RETRY_BACKOFF_SECS = (2.0, 5.0)
 _TRANSIENT_STATUS = (502, 503)
 _PROVIDER_UNAVAILABLE = "provider_unavailable"
 
+# The extraction (`infer=true`) write is the one mem0 call whose latency is set by an LLM hop
+# (app -> go-rotation -> the model), and it is the one call that could silently lose a turn: the flat
+# 30 s client timeout sat INSIDE the live distribution, so extractions the server was still
+# completing were cut off client-side (measured 2026-09-23: median 3.7 s, p90 9.8 s, p99 27.6 s, max
+# 35.8 s over 375 calls in 2 h 49 m from go-rotation's own log; 8 turns lost to `timeout` that day).
+# The server's own budget for that leg is MEM0_LLM_TIMEOUT=90, so any client budget below 90 s can
+# only ever cut off work the server would have finished. 120 s = that 90 s server budget + 30 s for
+# the extraction semaphore queue, the embedding and the store write; ~3.4x the observed max, >12x
+# p90. Reads/searches and the exact `infer=false` fast path keep the flat 30 s budget: they are
+# user-facing and were never this loss class. The wait is on the background sync thread, never the
+# turn loop, so a slow extraction still costs the user nothing.
+_EXTRACT_READ_TIMEOUT_SECS = 120.0
+_EXTRACT_TIMEOUT_SECS = 30.0  # connect budget for the extraction write; unchanged
+_EXTRACT_TIMEOUT_RETRIES = 1  # a read timeout retries exactly once (see _extraction_retryable)
+
 
 def _add_kwargs(user_id: str, agent_id: str, infer: bool, metadata: dict | None) -> dict[str, Any]:
     return {"user_id": user_id, "agent_id": agent_id, "infer": infer, **({"metadata": metadata} if metadata else {})}
@@ -31,7 +46,7 @@ def _unwrap_results(response: Any) -> list:
     return response.get("results", []) if isinstance(response, dict) else response if isinstance(response, list) else []
 
 
-def _is_transient_upstream(exc: BaseException) -> bool:
+def _is_transient_upstream(exc: BaseException, *, allow_timeout: bool = False) -> bool:
     """True only for a failure that provably did NOT store anything and may self-heal.
 
     Two cases, both narrow on purpose:
@@ -40,6 +55,11 @@ def _is_transient_upstream(exc: BaseException) -> bool:
       * the socket never connected (dead hop, connect timeout): nothing reached the server.
     A read timeout is deliberately NOT retried — the request may already have been stored, and a
     retry would then duplicate the memory. A 4xx is the caller's problem: never retried.
+
+    ``allow_timeout`` exists for the EXTRACTION write only (``_extraction_retryable``): its 120 s
+    budget is far outside the live distribution, so a timeout there means something is genuinely
+    wrong upstream, and one bounded retry is worth more than a lost turn. It is never enabled for
+    the ``infer=false`` fast path or a read.
     """
     import httpx
 
@@ -52,10 +72,34 @@ def _is_transient_upstream(exc: BaseException) -> bool:
         except Exception:  # a proxy's HTML error page carries no classified body
             return True
         return code in (None, _PROVIDER_UNAVAILABLE)
-    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return True
+    return bool(allow_timeout and isinstance(exc, httpx.TimeoutException))
 
 
-def _retry_transient(call, *, attempts: int | None = None, backoff: tuple | None = None, sleep=time.sleep, log=logger):
+def _extraction_retryable() -> Callable[[BaseException], bool]:
+    """Predicate for the extraction write: transient upstream errors as before, plus ONE timeout.
+
+    A timed-out extraction may already have landed server-side, so the timeout retry is bounded to a
+    single attempt (a duplicate is recoverable — the replay worker checks the tenant first — while a
+    silently dropped turn is not). Every attempt that reaches the server is still counted by
+    ``GET /metrics``, and the caller records the turn if the retry also fails.
+    """
+    timeouts_allowed = _EXTRACT_TIMEOUT_RETRIES
+
+    def predicate(exc: BaseException) -> bool:
+        nonlocal timeouts_allowed
+        if _is_transient_upstream(exc):
+            return True
+        if _is_transient_upstream(exc, allow_timeout=True) and timeouts_allowed > 0:
+            timeouts_allowed -= 1
+            return True
+        return False
+
+    return predicate
+
+
+def _retry_transient(call, *, attempts: int | None = None, backoff: tuple | None = None, sleep=time.sleep, log=logger, retryable=None):
     """Run ``call`` while it fails transiently, then re-raise the last error.
 
     The final error still propagates, so the memory plugin's circuit breaker and its
@@ -64,16 +108,23 @@ def _retry_transient(call, *, attempts: int | None = None, backoff: tuple | None
     """
     attempts = _SYNC_RETRY_ATTEMPTS if attempts is None else max(1, attempts)
     backoff = _SYNC_RETRY_BACKOFF_SECS if backoff is None else backoff
+    retryable = retryable or _is_transient_upstream
     for attempt in range(1, attempts + 1):
         try:
             return call()
         except Exception as exc:
-            if attempt == attempts or not _is_transient_upstream(exc):
+            if attempt == attempts or not retryable(exc):
+                # Stamp the failure with how many attempts it took, so the drop record the caller
+                # writes can say whether the one bounded retry was used (or even issued) - an
+                # operator reading the ledger wants "the retry failed too" vs "no retry was made".
+                with suppress(Exception):
+                    setattr(exc, "mem0_attempts", attempt)
                 raise
             delay = backoff[min(attempt - 1, len(backoff) - 1)]
             log.info("Mem0 extraction write hit a transient upstream error (%s); retrying in %.1fs (%d of %d retries)", exc, delay, attempt, attempts - 1)
             sleep(delay)
     raise RuntimeError("unreachable: _retry_transient with attempts >= 1 always returns or raises")
+
 
 
 class Mem0Backend(ABC):
@@ -131,9 +182,12 @@ class SelfHostedBackend(Mem0Backend):
         headers = {"Content-Type": "application/json", **({"X-API-Key": api_key} if api_key else {})}  # key omitted only for AUTH_DISABLED servers
         # Connect-level retries keep one dropped SYN from counting toward the breaker. ``transport`` is injectable for tests.
         self._client = httpx.Client(base_url=host.rstrip("/"), headers=headers, timeout=30.0, transport=transport or httpx.HTTPTransport(retries=2))
+        # The extraction write gets its own READ budget (see _EXTRACT_READ_TIMEOUT_SECS); everything
+        # else - search, update, delete, the exact `infer=false` add - keeps the flat 30s above.
+        self._extract_timeout = httpx.Timeout(_EXTRACT_TIMEOUT_SECS, read=_EXTRACT_READ_TIMEOUT_SECS)
 
-    def _json(self, method: str, path: str, **kwargs) -> Any:
-        resp = self._client.request(method, path, **kwargs)
+    def _json(self, method: str, path: str, *, timeout=None, **kwargs) -> Any:
+        resp = self._client.request(method, path, timeout=timeout, **kwargs)
         resp.raise_for_status()
         return resp.json() if resp.content else {}
 
@@ -150,7 +204,10 @@ class SelfHostedBackend(Mem0Backend):
         payload = {"messages": messages, **_add_kwargs(user_id, agent_id, infer, metadata)}
         if not infer:
             return self._json("POST", "/memories", json=payload)  # explicit write: single-shot, unchanged
-        return _retry_transient(lambda: self._json("POST", "/memories", json=payload))
+        return _retry_transient(
+            lambda: self._json("POST", "/memories", json=payload, timeout=self._extract_timeout),
+            retryable=_extraction_retryable(),
+        )
 
     def _update(self, memory_id: str, text: str) -> None:
         self._json("PUT", f"/memories/{memory_id}", json={"text": text})

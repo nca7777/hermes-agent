@@ -1062,6 +1062,37 @@ def _peek_pool_entry(provider: str, pool: Any = None) -> Optional[Any]:
     return None
 
 
+def _pool_key_is_benched(provider: str, api_key: str, *, pool: Any = None) -> bool:
+    """True when *api_key* is a key one of *provider*'s pool entries has benched.
+
+    A route that carries its own resolved key (the session's runtime key, an aux slot's
+    ``api_key``) bypasses pool rotation exactly the way an env var does, so the key stays the
+    one the caller started with. After a rotation that is the credential the pool just benched,
+    and the rejection the retry then gets back is blamed on the entry the pool rotated TO — a
+    live account benched for the provider's whole reset window on another account's cap. Callers
+    use this to prefer the pool's live entry over that key.
+    """
+    key = str(api_key or "").strip()
+    if not key:
+        return False
+    if pool is None:
+        pool = _load_pool_with_credentials(provider, " (benched key)")
+    if pool is None:
+        return False
+    try:
+        from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED
+
+        entries = list(pool.entries())
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not list pool entries for %s: %s", provider, exc)
+        return False
+    return any(
+        _pool_runtime_api_key(entry) == key
+        and getattr(entry, "last_status", None) in (STATUS_EXHAUSTED, STATUS_DEAD)
+        for entry in entries
+    )
+
+
 def _pool_runtime_api_key(entry: Any) -> str:
     # runtime_api_key handles provider-specific fallback (e.g. agent_key for nous); None entry → "".
     key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
@@ -5941,12 +5972,25 @@ def _get_cached_client(
             del _client_cache[cache_key]
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
-    # and retry an exhausted key.
+    # and retry an exhausted key. A route that carries its own resolved key (the session's
+    # runtime key, an aux slot ``api_key``) bypasses it the same way, so a key the pool has
+    # already benched is replaced by the pool's live entry too: otherwise the retry after a
+    # rotation re-sends the benched credential, and the rejection that comes back is blamed on
+    # the entry the pool rotated to — benching a live account for its whole reset window.
     effective_api_key = api_key
-    if not effective_api_key:
-        _pe = _peek_pool_entry(_normalize_aux_provider(provider))
-        if _pe is not None:
-            effective_api_key = _pool_runtime_api_key(_pe) or api_key
+    aux_provider = _normalize_aux_provider(provider)
+    pool = _load_pool_with_credentials(aux_provider, " (key derivation)") if aux_provider else None
+    if pool is not None and (
+        not effective_api_key or _pool_key_is_benched(aux_provider, effective_api_key, pool=pool)
+    ):
+        _pe = _peek_pool_entry(aux_provider, pool)
+        if _pe is not None and _pool_runtime_api_key(_pe):
+            if effective_api_key:
+                logger.info(
+                    "Auxiliary %s: resolved key is a benched pool entry; using the pool's live "
+                    "entry %s instead", aux_provider, getattr(_pe, "id", "?"),
+                )
+            effective_api_key = _pool_runtime_api_key(_pe)
     client, default_model = resolve_provider_client(
         provider, model, async_mode, explicit_base_url=base_url, explicit_api_key=effective_api_key,
         api_mode=api_mode, main_runtime=runtime, is_vision=is_vision, task=task,

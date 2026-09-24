@@ -329,3 +329,58 @@ class TestResetAwareRestoreGate:
             assert agent._restore_primary_runtime() is True
         assert agent._fallback_activated is False
         assert agent._rate_limited_until == 0
+
+
+class TestRemovedChainReturnsToThePrimary:
+    """A chain REMOVED under a live activation (the pause guard's engage, or the user deleting
+    ``fallback_providers``) must return the session to the primary instead of parking it on the
+    metered fallback for the rest of the cooldown. Both gates below exist to keep the session
+    usable ON the fallback until the primary's reset — with no chain there is nothing to fall
+    back to, so honouring them only keeps billing a provider the operator just removed."""
+
+    FB = {"provider": "fireworks", "model": "accounts/fireworks/models/deepseek-v4p1-flash"}
+
+    def test_benched_primary_no_longer_parks_the_session(self):
+        agent = _make_agent(fallback_model=self.FB)
+        primary_runtime = (agent.provider, agent.model)
+        _activate_fallback(agent)
+        # Post-loader state: the chain edit was adopted, the cooldown it armed was cleared.
+        agent._fallback_chain = []
+        agent._fallback_model = None
+        agent._rate_limited_until = 0
+        # The Go cap window: the primary's own pool says nobody can serve for hours.
+        agent._credential_pool = _FakePool("custom", next_at=time.time() + 93 * 3600)
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert agent._fallback_activated is False
+        assert (agent.provider, agent.model) == primary_runtime
+
+    def test_still_armed_cooldown_is_ignored_with_no_chain_left(self):
+        """Even if the cooldown stamp survives (a sync path that did not clear it), no chain means
+        no reason to keep the session on the metered provider."""
+        agent = _make_agent(fallback_model=self.FB)
+        primary_runtime = (agent.provider, agent.model)
+        _activate_fallback(agent)
+        agent._fallback_chain = []
+        agent._fallback_model = None
+        agent._rate_limited_until = time.monotonic() + 3600
+        agent._credential_pool = _FakePool("custom", next_at=None, available=False)
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert agent._fallback_activated is False
+        assert agent._rate_limited_until == 0
+        assert (agent.provider, agent.model) == primary_runtime
+
+    def test_configured_chain_still_parks_on_the_benched_primary(self):
+        """Control: with the chain still configured, the reset-aware gate keeps its existing
+        behaviour (stay usable on the fallback until the primary's reset elapses)."""
+        agent = _make_agent(fallback_model=self.FB)
+        _activate_fallback(agent)
+        agent._rate_limited_until = 0
+        agent._credential_pool = _FakePool("custom", next_at=time.time() + 3600)
+
+        assert agent._restore_primary_runtime() is False
+        assert agent._fallback_activated is True
+        assert agent.provider == "fireworks"

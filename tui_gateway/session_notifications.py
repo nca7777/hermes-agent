@@ -312,9 +312,26 @@ def _kb_completed(task, payload: dict, title: str) -> str:
 
 
 def _kb_timed_out(task, payload: dict, title: str) -> str:
-    with contextlib.suppress(TypeError, ValueError):
-        return f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); will retry"
-    return " timed out (max_runtime=0s); will retry"
+    """Cause-first, and never a duration for a card that has no cap.
+
+    ``timed_out`` covers two failures with different remedies: a worker stopped at its per-task
+    runtime cap, and a worker that ran out of iterations. The second is not a time limit, and a
+    card with ``max_runtime_seconds = NULL`` has no duration to report — formatting the NULL as
+    ``0s`` claims a zero-second cap the card never had. See ``hermes_cli.kanban_event_wording``.
+    """
+    # Imported inside the body (as every other cross-package helper here is): this module's bodies
+    # are rebound onto server.py's globals by ``bind_module``, so a module-level name would not be
+    # resolvable at call time.
+    from hermes_cli import kanban_event_wording as _wording
+
+    payload = payload if isinstance(payload, dict) else {}
+    cause = _wording.timed_out_cause(payload)
+    if cause == _wording.CAUSE_ITERATION_BUDGET:
+        return f" {_wording.iteration_budget_clause(payload)}; will retry"
+    limit = _wording.timed_out_limit_seconds(payload)
+    if limit is None:
+        return " timed out; will retry"
+    return f" timed out (max_runtime={limit}s); will retry"
 
 
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.

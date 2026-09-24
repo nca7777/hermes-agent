@@ -25,6 +25,7 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_event_wording import CAUSE_RUNTIME_LIMIT
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -847,6 +848,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             )
             if cur.rowcount == 1:
                 payload = {
+                    "cause": CAUSE_RUNTIME_LIMIT,
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": limit,
@@ -1618,7 +1620,15 @@ def _record_task_failure(
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
-                _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
+                # The caller's extra fields belong on the event whether or not the breaker trips:
+                # a notice reads the EVENT, and dropping them here left the retry notice unable to
+                # name the failure it was reporting (a budget-exhausted worker's event carried no
+                # budget, so it read as a runtime timeout). The tripping branch below has always
+                # merged them.
+                event_payload = {"error": error, **detail}
+                if event_payload_extra:
+                    event_payload.update(event_payload_extra)
+                _kb._append_event(conn, task_id, outcome, event_payload, run_id=run_id)
             return False
 
         # Spawn path (release_claim) is still running and also clears claim

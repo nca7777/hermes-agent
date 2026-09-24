@@ -560,37 +560,16 @@ class GatewayConfigLoadersMixin:
         (``restore_primary_runtime`` owns that lifecycle); otherwise replaces the chain so
         mid-uptime ``fallback_providers`` edits apply without a restart.
 
-        A config edit that REMOVES the chain is the exception: the cooldown was armed for a chain
-        that no longer exists, so an explicit operator/config action (the pause guard emptying
-        ``fallback_providers``, or the user deleting it) outranks it. Clearing the cooldown stamp
-        here is what hands the live activated session back to ``restore_primary_runtime``, which
-        returns it to the primary on the next turn instead of leaving it on the metered fallback
-        for the rest of the window. ``_fallback_activated`` is deliberately left for that function
-        to clear: clearing it here would make its own early return skip the runtime restoration and
-        strand the session on the fallback provider with an empty chain.
-
         When primary is active (or cooldown expired), replace the chain so mid-uptime ``fallback_providers``
         edits take effect without requiring a gateway restart (#60955).
         """
         if agent is None:
             return
         new_chain = list(chain or [])
-        old_chain = list(getattr(agent, "_fallback_chain", []) or [])
         rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
-        activated = bool(getattr(agent, "_fallback_activated", False))
-        if activated and new_chain and rate_limited_until > time.monotonic():
+        if getattr(agent, "_fallback_activated", False) and rate_limited_until > time.monotonic():
             return
-        if activated and not new_chain and old_chain:
-            # The chain was REMOVED out from under a live activation: retire the cooldown it armed
-            # so the edit is adopted instead of being ignored for its whole (possibly days-long,
-            # provider-reset-sourced) duration. Only on the transition, so the per-message no-op
-            # refresh does not re-log or re-clear once the chain is already empty.
-            logger.info(
-                "fallback_providers removed while %s was active on a fallback: clearing the "
-                "cooldown so the session returns to the primary", getattr(agent, "provider", "?"),
-            )
-            agent._rate_limited_until = 0
-            agent._rate_limit_backoff_count = 0
+        old_chain = list(getattr(agent, "_fallback_chain", []) or [])
         agent._fallback_chain = new_chain
         agent._fallback_model = new_chain[0] if new_chain else None
         if not getattr(agent, "_fallback_activated", False):

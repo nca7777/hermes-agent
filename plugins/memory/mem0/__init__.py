@@ -24,6 +24,7 @@ from tools.registry import tool_error
 from utils import atomic_json_write, read_json_or_empty
 
 from . import _backend as _mem0_backend
+from . import _loss_record
 
 logger = logging.getLogger(__name__)
 
@@ -223,16 +224,32 @@ class Mem0MemoryProvider(MemoryProvider):
             hint = self._oss_hint(" Check that your {vs} vector store is running and reachable.", "unknown")
             logger.warning("Mem0 circuit breaker tripped after %d consecutive failures. Pausing API calls for %ds.%s", count, _BREAKER_COOLDOWN_SECS, hint)
 
-    def _try(self, call, log, msg: str):
-        """Background-path wrapper: run ``call`` under the breaker; on error log ``msg`` and return None."""
+    def _try(self, call, log, msg: str, on_error=None):
+        """Background-path wrapper: run ``call`` under the breaker; on error log ``msg`` and return None.
+
+        ``on_error`` (optional) receives the exception after the log line, for callers that must leave
+        a DURABLE trace of the drop - an extraction loss is otherwise only a log warning that no audit
+        reads without scanning every home. It never runs on success and never changes the return value.
+        """
         try:
             result = call()
         except Exception as e:
             self._record_failure()
             log(msg, e)
+            if on_error is not None:
+                with suppress(Exception):
+                    on_error(e)
             return None
         self._record_success()
         return result
+
+    def _record_sync_loss(self, event: str, session_id: str, messages: list, exc: Exception | None = None):
+        """Persist a dropped extraction turn (see ``_loss_record``); never raises, never blocks."""
+        try:
+            _loss_record.record(event=event, exc=exc, session=session_id or None, turn=messages,
+                               attempts=getattr(exc, "mem0_attempts", None))
+        except Exception as e:  # belt and braces: record() already swallows, but a lost turn must not
+            logger.debug("Mem0 extraction loss could not be recorded: %s", e)
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = cfg = _load_config()
@@ -311,23 +328,37 @@ class Mem0MemoryProvider(MemoryProvider):
         return self._consume_prefetch_result(query) or ""  # slow backend: skip injection; mem0_search remains the backstop
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
-        if self._backend is None or self._is_breaker_open():
+        """Send the turn to Mem0 for server-side fact extraction (non-blocking).
+
+        Every way this turn can be dropped is recorded (see ``_loss_record``): an attempt that
+        failed, one skipped because the previous sync was still in flight, one skipped while the
+        circuit breaker is open, and one skipped because there is no backend. Before this, only the
+        first left any trace at all (a log warning), which is how ~0.6% of turns went missing
+        silently.
+        """
+        messages = [
+            {"role": "user", "content": _truncate_for_sync(user_content, self._sync_max_chars)},
+            {"role": "assistant", "content": _truncate_for_sync(assistant_content, self._sync_max_chars)},
+        ]
+        if self._backend is None:
+            self._record_sync_loss("skipped_no_backend", session_id, messages)
+            return
+        if self._is_breaker_open():
+            self._record_sync_loss("skipped_breaker", session_id, messages)
             return
 
         def _sync():
             if self._backend is not None:
-                messages = [
-                    {"role": "user", "content": _truncate_for_sync(user_content, self._sync_max_chars)},
-                    {"role": "assistant", "content": _truncate_for_sync(assistant_content, self._sync_max_chars)},
-                ]
-                self._try(lambda: self._add(messages, infer=True), logger.warning, "Mem0 sync failed: %s")
+                self._try(lambda: self._add(messages, infer=True), logger.warning, "Mem0 sync failed: %s",
+                          on_error=lambda e: self._record_sync_loss("lost", session_id, messages, exc=e))
 
         with self._sync_lock:
             prev = self._sync_thread
             if prev and prev.is_alive():
                 prev.join(timeout=_SYNC_JOIN_SECS)
                 if prev.is_alive():  # still busy after the wait: skip to avoid duplicate ingestion
+                    self._record_sync_loss("skipped_busy", session_id, messages)
+                    logger.warning("Mem0 sync skipped: previous extraction still in flight after %.0fs", _SYNC_JOIN_SECS)
                     return
             self._sync_thread = spawn_context_thread(_sync, name="mem0-sync")
             self._sync_thread.start()

@@ -20,6 +20,10 @@ from agent.i18n import t
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
 from gateway.wake import session_owned_by_profile
 
+# Pure-stdlib leaf: the kanban notice FACTS shared with the TUI/Desktop notice, so the two surfaces
+# cannot disagree about why one card stopped. See that module's docstring.
+from hermes_cli import kanban_event_wording as _wording
+
 
 def _kbc():
     from hermes_cli import kanban_db_connect
@@ -447,7 +451,30 @@ def _fmt_gave_up(ev, n) -> tuple:
 
 
 def _fmt_timed_out(ev, n) -> tuple:
-    limit = int(_payload(ev, "limit_seconds") or 0)
+    """``timed_out`` is two different failures; the notice must name the one this event records.
+
+    A worker out of iterations is not a worker out of time — the remedy is a smaller or checkpointed
+    card, not more seconds — and a card with no ``max_runtime_seconds`` has no limit to report, so
+    a missing cap must not be narrated as a time limit at all. Facts come from
+    ``hermes_cli.kanban_event_wording``, the same module the TUI/Desktop notice reads.
+    """
+    payload = getattr(ev, "payload", None) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    if _wording.timed_out_cause(payload) == _wording.CAUSE_ITERATION_BUDGET:
+        return (
+            f"⏱ {n.head} {_wording.iteration_budget_clause(payload)} and was stopped; "
+            "it will be retried automatically. Scope it smaller or checkpoint it before the retry "
+            "spends the same budget.",
+            None, None,
+        )
+    limit = _wording.timed_out_limit_seconds(payload)
+    if limit is None:
+        return (
+            f"⏱ {n.head} was stopped by the dispatcher and will be retried automatically; the card "
+            "has no runtime cap set, so this was not a time limit.",
+            None, None,
+        )
     minutes = max(1, round(limit / 60)) if limit else 0
     span = f"its {minutes}-minute limit" if minutes else "its time limit"
     return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None

@@ -211,6 +211,8 @@ type KanbanMessages = {
     gaveUpBody: string
     crashedTitle: string
     timedOutTitle: string
+    /** A worker out of ITERATIONS is not a worker out of time — a different remedy. */
+    iterationBudgetTitle: string
     openKanban: string
     artifacts: (n: number) => string
   }
@@ -425,6 +427,7 @@ export const en: KanbanMessages = {
     gaveUpBody: 'Hermes couldn’t finish this task. Open Kanban to see why and reassign it.',
     crashedTitle: 'Task hit a problem — Hermes will retry it automatically',
     timedOutTitle: 'Task took too long — Hermes will retry it automatically',
+    iterationBudgetTitle: 'Task ran out of its work budget — Hermes will retry it automatically',
     openKanban: 'Open Kanban',
     artifacts: (n: number) => `${n} artifacts`
   }
@@ -638,6 +641,7 @@ const ja: KanbanMessages = {
     gaveUpBody: 'Hermes はこのタスクを完了できませんでした。かんばんを開いて原因を確認し、再割り当てしてください。',
     crashedTitle: 'タスクで問題が発生 — Hermes が自動で再試行します',
     timedOutTitle: 'タスクに時間がかかりすぎました — Hermes が自動で再試行します',
+    iterationBudgetTitle: 'タスクの作業回数の上限に達しました — Hermes が自動で再試行します',
     openKanban: 'かんばんを開く',
     artifacts: (n: number) => `成果物 ${n} 件`
   }
@@ -848,6 +852,7 @@ const zh: KanbanMessages = {
     gaveUpBody: 'Hermes 无法完成这个任务。打开看板查看原因并重新分配。',
     crashedTitle: '任务遇到问题 — Hermes 将自动重试',
     timedOutTitle: '任务耗时过长 — Hermes 将自动重试',
+    iterationBudgetTitle: '任务已用完工作次数上限 — Hermes 将自动重试',
     openKanban: '打开看板',
     artifacts: (n: number) => `${n} 个产物`
   }
@@ -1058,6 +1063,7 @@ const zhHant: KanbanMessages = {
     gaveUpBody: 'Hermes 無法完成這個任務。開啟看板查看原因並重新指派。',
     crashedTitle: '任務遇到問題 — Hermes 將自動重試',
     timedOutTitle: '任務耗時過長 — Hermes 將自動重試',
+    iterationBudgetTitle: '任務已用完工作次數上限 — Hermes 將自動重試',
     openKanban: '開啟看板',
     artifacts: (n: number) => `${n} 個產物`
   }

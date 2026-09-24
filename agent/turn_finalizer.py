@@ -59,6 +59,7 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db_dispatch as _kbd
+        from hermes_cli.kanban_event_wording import CAUSE_ITERATION_BUDGET
         _conn = _kbc.connect()
         try:
             _kbd._record_task_failure(
@@ -71,7 +72,14 @@ def _record_kanban_budget_exhausted(
                 outcome="timed_out",
                 release_claim=True,
                 end_run=True,
-                event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
+                # Name the cause on the event: ``timed_out`` is shared with a worker stopped at its
+                # per-task runtime cap, and the two need different remedies. Without this the notice
+                # reads the card as out of TIME when it is out of ITERATIONS.
+                event_payload_extra={
+                    "cause": CAUSE_ITERATION_BUDGET,
+                    "budget_used": api_call_count,
+                    "budget_max": max_iterations,
+                },
             )
         finally:
             with suppress(Exception):

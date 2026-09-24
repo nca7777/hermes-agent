@@ -37,8 +37,12 @@ export interface MockServerOptions {
   /** Extra ids listed by GET /v1/models beside `mock-model` (a pickable second model). */
   extraModels?: string[]
 
-  /** Pause the matching stream after its first token for session-switch E2E coverage. */
+  /** Pause the matching stream after its first token for session-switch E2E coverage.
+   *  `holdStreamAfterWords` moves the pause deeper into the reply: freezing MID-paragraph
+   *  is the window where a half-written transcript directive is on screen. */
   holdFirstStreamForPrompt?: string
+/** How many tokens the held stream emits before it pauses (default 1). */
+holdStreamAfterWords?: number
 /** Pause the first completion whose request JSON contains this text. */
 holdFirstCompletionContaining?: string
 /** Absolute sandbox path written by the verify-on-stop scripted tool call. */
@@ -830,7 +834,7 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
               resolveHeldStreamStarted?.()
 
               return heldStreamReleased
-            } : undefined)
+            } : undefined, options.holdStreamAfterWords ?? 1)
           } else {
             if (holdThisCompletion) {
               heldCompletionCount++
@@ -915,6 +919,7 @@ function streamTextResponse(
   model: string,
   text: string,
   waitForRelease?: () => Promise<void>,
+  holdAfterWords = 1,
 ): void {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -938,7 +943,7 @@ function streamTextResponse(
     res.write(sseChunk(model, { content: word }))
     i++
 
-    if (waitForRelease && i === 1) {
+    if (waitForRelease && i === holdAfterWords) {
       waitForRelease().then(() => setTimeout(sendChunk, 20))
 
       return

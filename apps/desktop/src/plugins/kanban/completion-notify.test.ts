@@ -443,6 +443,38 @@ describe('terminal kinds beyond completed', () => {
     expect(hostMock.notify.mock.calls[2][0]).toMatchObject({ kind: 'warning', message: 't103' })
   })
 
+  it('timed_out names its cause: an iteration-budget exhaustion is not a too-long task', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(101, 'timed_out', { cause: 'iteration_budget', budget_used: 80, budget_max: 80 }),
+      ev(102, 'timed_out', { cause: 'runtime_limit', limit_seconds: 900 }),
+      ev(103, 'timed_out', { budget_used: 40, budget_max: 40 }), // pre-stamp event: inferred
+      ev(104, 'timed_out', { limit_seconds: 'not-a-number' }), // unreadable cap: no budget claim
+      // The exact payload stored on the card that reported the bug: no cause field, no cap.
+      ev(105, 'timed_out', {
+        error: 'Iteration budget exhausted (80/80) — task could not complete within the allowed iterations'
+      })
+    ])
+
+    expect(hostMock.notify.mock.calls[0][0]).toMatchObject({
+      title: 'Task ran out of its work budget — Hermes will retry it automatically'
+    })
+    expect(hostMock.notify.mock.calls[1][0]).toMatchObject({
+      title: 'Task took too long — Hermes will retry it automatically'
+    })
+    expect(hostMock.notify.mock.calls[2][0]).toMatchObject({
+      title: 'Task ran out of its work budget — Hermes will retry it automatically'
+    })
+    expect(hostMock.notify.mock.calls[3][0]).toMatchObject({
+      title: 'Task took too long — Hermes will retry it automatically'
+    })
+    expect(hostMock.notify.mock.calls[4][0]).toMatchObject({
+      title: 'Task ran out of its work budget — Hermes will retry it automatically'
+    })
+  })
+
   it('gave_up without a payload error still gets the plain-words body and no empty detail noise', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
