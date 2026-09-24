@@ -975,8 +975,12 @@ class EmailAdapter(BasePlatformAdapter):
         if _SELF_MESSAGE_ID_RE.match(str(msg_data.get("message_id") or "").strip()):
             logger.debug("[Email] Dropping our own outbound mail returning to the mailbox: %s", msg_data.get("message_id"))
             return False
-        if sender_addr.lower() == self._from_address.lower() and not self._recipients:
-            return False
+        # No recipients gate configured => nothing can tell our mail from the operator's, so the
+        # historic strict guard applies to BOTH identities: the address we send as and the login address.
+        if not self._recipients:
+            self_identities = {addr.lower() for addr in (self._from_address, self._address) if addr}
+            if sender_addr.lower() in self_identities:
+                return False
         if self._recipients and not (self._recipients & set(msg_data.get("recipients") or [])):
             logger.debug("[Email] Dropping mail not addressed to Hermes: %s", sender_addr)
             return False
@@ -1162,7 +1166,13 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     """Out-of-process Email delivery via SMTP (one-shot); standalone_sender_fn contract."""
     extra = getattr(pconfig, "extra", {}) or {}
     address, password = extra.get("address") or _get_secret("EMAIL_ADDRESS", ""), _get_secret("EMAIL_PASSWORD", "")
-    from_address = (extra.get("from_address") or _get_secret("EMAIL_FROM", "")).strip() or address
+    # The platform config handed to this send is authoritative: its explicit from_address (alias) first,
+    # then the address it was built with. Only when it carries no address at all does the ambient
+    # EMAIL_FROM decide — an env var belongs to the process, not to this platform (a caller that builds
+    # its own config, a cron process running under a different home), so it must not override the
+    # address that was passed in for this send. Falls back to EMAIL_ADDRESS when everything is empty.
+    from_address = (extra.get("from_address") or extra.get("address")
+                    or _get_secret("EMAIL_FROM", "")).strip() or address
     smtp_host = extra.get("smtp_host") or _get_secret("EMAIL_SMTP_HOST", "")
     smtp_port = _esecret_int("EMAIL_SMTP_PORT", 587) or int(extra.get("smtp_port") or 587)
     smtp_security = _normalize_security(_get_secret("EMAIL_SMTP_SECURITY", "") or extra.get("smtp_security"), default="tls" if smtp_port == 465 else "starttls")
