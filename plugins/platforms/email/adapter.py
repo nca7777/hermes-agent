@@ -33,9 +33,22 @@ from gateway.platforms._shared import get_scoped_secret as _get_secret, coerce_p
 
 logger = logging.getLogger(__name__)
 
-# Message-IDs this adapter mints for its OWN outbound mail (see _new_reply): `<hermes-<12 hex>@domain>`.
+# Message-IDs this adapter mints for its OWN outbound mail, shape ``<hermes-<12 hex>@domain>``:
+# _new_reply for in-process replies and _standalone_send for out-of-process cron/startup notices.
 # Anything arriving with such an id is our own mail coming back — see the loop guard in _sender_accepted.
 _SELF_MESSAGE_ID_RE = re.compile(r"^<\s*hermes-[0-9a-f]{12}@", re.IGNORECASE)
+
+
+def _self_message_id_domain(*addresses: str) -> str:
+    """Domain for generated Message-IDs: the first address carrying an ``@``, else ``localhost``.
+
+    Shared by every minting site (_new_reply, _standalone_send) so the loop guard sees one shape."""
+    for addr in addresses:
+        addr = str(addr or "").strip()
+        if "@" in addr:
+            return addr.rsplit("@", 1)[-1]
+    return "localhost"
+
 
 _SECURITY_ALIASES = {"tls": "tls", "ssl": "tls", "implicit": "tls", "starttls": "starttls", "plain": "plain", "none": "plain"}
 # Automated senders (address substrings / bulk-mail headers) are silently ignored.
@@ -963,12 +976,16 @@ class EmailAdapter(BasePlatformAdapter):
         # the historic behaviour exactly.
         # ...but when Hermes *is* the operator's own address (plus addressing: the mailbox is
         # nca+hermes@... inside nca@...'s account), the sender legitimately equals the From identity.
-        # That is safe only because the recipients gate below proves the mail was addressed to the
-        # Hermes-only mailbox, and Hermes never sends TO that mailbox — so no loop can form. No
+        # Skipping the identity guard there is safe only because our own outbound mail is dropped
+        # structurally below — it carries a Message-ID this adapter minted — so the loop is broken by
+        # that id, NOT by the claim that Hermes never sends TO this mailbox: nothing here enforces that
+        # claim, and a cron/startup notice addressed to the channel mailbox is exactly that send. No
         # recipients gate configured => keep the strict guard.
         # Structural loop guard: mail carrying a Message-ID this adapter mints for its own outbound
-        # replies is OUR OWN mail returning to the mailbox — e.g. a startup/cron notification delivered
-        # to the channel mailbox because the email home address points at it. The recipients gate cannot
+        # mail is OUR OWN mail returning to the mailbox — e.g. a startup/cron notification delivered
+        # to the channel mailbox because the email home address points at it. BOTH minting sites count:
+        # _new_reply (in-process replies) and _standalone_send (out-of-process cron/startup sends, i.e.
+        # the notice case itself), so neither may skip minting this shape. The recipients gate cannot
         # catch that case (the operator's mail and ours share one From: identity under plus addressing),
         # so without this the channel feeds its own notices back in as prompts. Forging the id only gets
         # the forger's mail dropped, so there is no downside to trusting it.
@@ -1048,7 +1065,7 @@ class EmailAdapter(BasePlatformAdapter):
 
     def _message_id_domain(self) -> str:
         """Domain for generated Message-IDs; ``localhost`` when EMAIL_ADDRESS lacks ``@``."""
-        return (self._address.rsplit("@", 1)[-1] if "@" in self._address else "") or "localhost"
+        return _self_message_id_domain(self._address)
 
     def _new_reply(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None, *,
                    attach_empty_body: bool = False, thread_id: Optional[str] = None) -> Tuple[MIMEMultipart, str, str]:
@@ -1181,7 +1198,14 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         return send_error("Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)")
     try:
         msg = MIMEText(message, "plain", "utf-8")
-        for key, value in (("From", from_address), ("To", chat_id), ("Subject", "Hermes Agent"), ("Date", formatdate(localtime=True))):
+        # Mint the Message-ID shape the loop guard in _sender_accepted recognises (<hermes-<12 hex>@…>).
+        # Without it this notice is not recognisable as ours: delivered to the channel mailbox because
+        # EMAIL_HOME_ADDRESS points at it, it comes back as inbound mail and — on a gated config, where
+        # the identity guard is deliberately skipped — is fed in as a prompt, i.e. the channel loops on
+        # its own startup/cron notices. Same shape as _new_reply, one helper for the domain.
+        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{_self_message_id_domain(from_address, address)}>"
+        for key, value in (("From", from_address), ("To", chat_id), ("Subject", "Hermes Agent"),
+                           ("Date", formatdate(localtime=True)), ("Message-ID", msg_id)):
             msg[key] = value
         server = _open_smtp(smtp_host, smtp_port, smtp_security, _tls_context(smtp_tls_verify, smtp_host), smtplib.SMTP, smtplib.SMTP_SSL)
         server.login(address, password)
